@@ -1,0 +1,666 @@
+---
+title: "Week 4 Progress Report"
+output: html_document
+date: "2025-01-31"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(ggplot2)
+library(tidyverse)
+library(dplyr)
+library(stargazer)
+library(knitr)
+library(kableExtra)
+library(plm)
+library(lme4)
+library(sf)
+library(leaflet)
+library(spdep)
+library(spatialreg)
+library(sp)
+library(terra)
+library(tmap)
+library(splm)
+library(plm)
+library(corrplot)
+library(gridExtra)
+```
+
+# Loading in Data
+
+```{r}
+df <- read.csv("C:/Users/timmy/Desktop/School Files/Capstone/Final CSVs/Final Spatial Data Pop Density Update.csv")
+states_sf <- st_read("C:/Users/timmy/Desktop/School Files/Capstone/tl_2024_us_state.shp", promote_to_multi = FALSE)
+
+df$State <- as.factor(df$State)
+```
+
+```{r}
+#states_sf <- st_cast(states_sf, "POLYGON")
+
+states_sf <- states_sf %>%
+  rename(State = NAME)
+
+# Temporarily save geometry and attributes separately
+geometry <- st_geometry(states_sf)
+attributes <- st_drop_geometry(states_sf)
+
+# Expand attributes to include all years
+expanded_attributes <- attributes %>%
+  mutate(dummy = 1) %>%  
+  expand_grid(Year = 2008:2019) %>%  
+  select(-dummy)  
+
+# Combine expanded attributes with original geometry
+states_sf <- st_sf(expanded_attributes, geometry = rep(geometry, each = length(2008:2019)))
+```
+
+# Data Wrangling
+
+```{r}
+df_test <- df 
+
+#df_test$DAMAGE_PROPERTY <- df_test$DAMAGE_PROPERTY / 1000
+#df_test$DAMAGE_CROPS <- df_test$DAMAGE_CROPS / 1000
+```
+
+```{r}
+final_df <- states_sf %>%
+  inner_join(df_test, by = c("State", "Year"))
+```
+
+```{r}
+final_df <- final_df %>%
+  filter(!State %in% c("Hawaii", "Alaska"))
+
+final_df <- final_df %>%
+  select(-total_damage_property.y, -total_damage_crops.y) %>%  
+  rename(
+    total_damage_property = total_damage_property.x,  
+    total_damage_crops = total_damage_crops.x  
+  )
+
+model_ready <- final_df %>%
+  arrange(Year, State)  %>% 
+  mutate(total_damage = total_damage_property + total_damage_crops) %>% 
+  mutate(td_per_cap = total_damage / Total_Residents)
+
+model_ready <- model_ready %>%
+  rename(
+    homePrems = Home.Avg.Premium,
+    rentersPrems = Renters.Avg.Premium,
+    HealthcareExp = Health.Spending.per.Capita,
+    Pop18_64 = Total_Pop_Dis,
+    Uninsured = Percent.Adults.19.64.Uninsured,
+    Medicaid = Percent,
+    PriceDef = RegionalPriDef,
+    Coastal = Is_Coastal,
+    MedHomeIncome = Median.Income
+  )
+```
+
+I redid my damage variable because, honestly, my previous method was pretty lazy. This time, I separated damage by type (property vs. crops) and by storm event. This ensures the model has access to the correct damage numbers. Additionally, based on this research paper https://www.nber.org/system/files/working_papers/w32579/w32579.pdf, I decided to split the damage into categories: those covered by typical homeowners insurance and those requiring separate coverage (earthquake, flood, etc). This helps the model distinguish between what is and isn’t covered by standard homeowners insurance.
+
+```{r}
+geometry <- st_geometry(model_ready)  
+model_ready_no_geom <- model_ready %>%
+  st_drop_geometry()
+
+sev_weather_property_cols <- names(model_ready_no_geom) %>%
+  str_subset("damage_property_(tornado|excessive_heat|heavy_snow|high_wind|hail|winter_storm|blizzard|ice_storm|strong_wind|lightning)")
+
+sev_weather_crops_cols <- names(model_ready_no_geom) %>%
+  str_subset("damage_crops_(tornado|excessive_heat|heavy_snow|high_wind|hail|winter_storm|blizzard|ice_storm|strong_wind|lightning)")
+
+disaster_property_cols <- names(model_ready_no_geom) %>%
+  str_subset("damage_property_(hurricane|flood|flash_flood|storm_surge_tide|wildfire|coastal_flood|lakeshore_flood|tsunami)")
+
+disaster_crops_cols <- names(model_ready_no_geom) %>%
+  str_subset("damage_crops_(hurricane|flood|flash_flood|storm_surge_tide|wildfire|coastal_flood|lakeshore_flood|tsunami)")
+
+model_ready_no_geom <- model_ready_no_geom %>%
+  mutate(
+    num_sev_weather_property = rowSums(select(., all_of(sev_weather_property_cols)), na.rm = TRUE),
+    num_sev_weather_crops = rowSums(select(., all_of(sev_weather_crops_cols)), na.rm = TRUE),
+    disasters_property = rowSums(select(., all_of(disaster_property_cols)), na.rm = TRUE),
+    disasters_crops = rowSums(select(., all_of(disaster_crops_cols)), na.rm = TRUE)
+  ) %>%
+  mutate(
+    home_damage = num_sev_weather_property + num_sev_weather_crops,
+    disaster_damage = disasters_property + disasters_crops
+  )
+
+model_ready <- st_sf(model_ready_no_geom, geometry = geometry)
+```
+
+```{r}
+states <- c("Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado", "Connecticut", 
+            "Delaware", "Florida", "Georgia", "Hawaii", "Idaho", "Illinois", "Indiana", 
+            "Iowa", "Kansas", "Kentucky", "Louisiana", "Maine", "Maryland", 
+            "Massachusetts", "Michigan", "Minnesota", "Mississippi", "Missouri", "Montana", 
+            "Nebraska", "Nevada", "New Hampshire", "New Jersey", "New Mexico", "New York", 
+            "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon", "Pennsylvania", 
+            "Rhode Island", "South Carolina", "South Dakota", "Tennessee", "Texas", 
+            "Utah", "Vermont", "Virginia", "Washington", "West Virginia", "Wisconsin", 
+            "Wyoming")
+
+square_miles <- c(52420, 665384, 113990, 53179, 163695, 104094, 5543, 2489, 65758, 59425, 10932, 83569, 
+                  57914, 36420, 56273, 82278, 40408, 52378, 35380, 12406, 10554, 96714, 86936, 48432, 
+                  69707, 147040, 77348, 110572, 9349, 8723, 121590, 54555, 53819, 70698, 44826, 
+                  69899, 98379, 46054, 1545, 32020, 77116, 42144, 268596, 84897, 9616, 42775, 71298, 
+                  24230, 65496, 97813) # Census Bureau 
+
+years <- rep(2008:2019, each = length(states))
+
+state_area <- data.frame(State = rep(states, times = length(2008:2019)),
+                       Square_Miles = rep(square_miles, times = length(2008:2019)),
+                       Year = years)
+
+state_area <- state_area[!state_area$State %in% c("Alaska", "Hawaii"), ]
+
+model_ready <- model_ready %>% 
+  left_join(state_area, by = c("State", "Year"))
+
+model_ready$PopDensity <- model_ready$Total_Residents / model_ready$Square_Miles
+
+model_ready <- model_ready %>%
+  arrange(Year, State)
+```
+
+```{r}
+model_ready_scaled <- model_ready %>%
+  mutate(across(c(homePrems, total_damage, HealthcareExp, Pop18_64, Uninsured, Medicaid, PriceDef, disaster_damage, PopDensity, td_per_cap, MedHomeIncome, home_damage), 
+                ~ {
+                  scaled_value <- (.-min(.)) / (max(.) - min(.))
+                  scaled_value[scaled_value == 0] <- 0.00000000000001
+                  scaled_value
+                }))
+```
+
+# Neighors and Weights
+
+Based on my intuition, a dynamic weight system seems most appropriate for capturing the effects of storms on homeowners' premiums. Initially, I used a queen contiguity approach with equal weighting for all neighbors, but that didn't seem suitable. A massive cold storm will likely affect the entire Northeast, but not evenly. So, I switched to distance-based neighbors, setting a 720 km threshold to ensure Texas and Louisiana were considered neighbors. Looking at states like New York and Alabama, the assigned neighbors seemed reasonable. The only downside is that California ends up with just one neighbor, but I think the benefits of properly fitting the Northeast outweigh that drawback.
+
+```{r}
+nb <- model_ready %>%
+  filter(Year %in% c(2011))
+
+centroids <- st_centroid(nb)  # This should already be in 'sf' format
+
+centroids_sp <- as(centroids, "Spatial")
+
+dist_matrix <- spDists(centroids_sp)
+
+neighbors <- dnearneigh(centroids_sp, 0, 720)  # You can adjust this threshold
+
+lw <- nb2listw(neighbors, style = "B", zero.policy = TRUE)  # Use binary weights first
+
+# Inverse distance weighting
+for (i in 1:length(neighbors)) {
+  neighbor_indices <- neighbors[[i]]
+  total_weight <- 0
+  for (j in 1:length(neighbor_indices)) {
+    distance <- dist_matrix[i, neighbor_indices[j]]
+    if (!is.na(distance) && distance != 0) {
+      weight <- 1 / distance
+      lw$weights[[i]][j] <- weight
+      total_weight <- total_weight + weight
+    } else {
+      lw$weights[[i]][j] <- 0
+    }
+  }
+  # Normalize weights
+  if (total_weight != 0) {
+    lw$weights[[i]] <- lw$weights[[i]] / total_weight
+  }
+}
+
+# Function to replicate weights and neighbors while maintaining class attributes and style (NOT USED FOR SPATIAL PLM)
+replicate_listw <- function(lw, times) {
+  replicated_weights <- rep(lw$weights, times)
+  replicated_neighbours <- do.call("c", replicate(times, lw$neighbours, simplify = FALSE))
+  
+  # Ensure neighbours has correct nb structure and region.id is a character
+  class(replicated_neighbours) <- class(lw$neighbours)
+  
+  # create listw structure, copying the structure of lw
+  expanded_weights <- list(
+    style = lw$style,  # Place style first
+    neighbours = replicated_neighbours,  # Place neighbours second
+    weights = replicated_weights  # Place weights last
+  )
+  class(expanded_weights) <- class(lw)
+  
+  return(expanded_weights)
+}
+
+# Determine the number of years
+num_years <- length(unique(final_df$Year))
+num_rows <- nrow(final_df)
+num_reps <- num_rows / length(lw$weights)
+
+weights_across_years <- replicate_listw(lw, num_reps)
+```
+
+```{r}
+# Plot neighbors connections
+plot(st_geometry(nb), border = "black") # plot polygons with gray borders
+plot(neighbors, st_coordinates(st_centroid(st_geometry(nb))), add = TRUE, col = "blue", lwd = 1.5)
+```
+```{r}
+#neighbor exploration
+neighbors[[30]] 
+model_ready$State[c(6 , 7 ,17 ,18 ,19 ,27 ,28 ,33 ,36 ,37 ,43 ,44 ,46)] # adjust based on neighbors[[i]]
+
+#weights exploration
+lw$weights[[30]]
+```
+
+```{r}
+#neighbor exploration
+neighbors[[1]] 
+model_ready$State[c(3,  8,  9, 15, 16, 22, 38, 40)] # adjust based on neighbors[[i]]
+
+#weights exploration
+lw$weights[[1]]
+```
+
+# Correlations and Finding The Best Functional Forms 
+
+Below are the variables I’ve decided to include in my model so far. `home_damage` is my treatment variable, and `homePrems` is my response variable. I believe the risk of natural disasters should be controlled for in the model. While disaster damage isn’t the best measure of risk, controlling for the damage caused could serve as an indirect measure. Surprisingly, `disaster_damage` and `home_damage` are only slightly correlated (~0.20). My expectation is that both damage variables should have a positive effect on homeowners' premiums. The remaining explanatory variables are price deflator, median household income, and population density. `PriceDef` is an indirect measure of inflation and helps control for the economic status of each state relative to the national average price deflator. Median household income provides insight into the socioeconomic status of the median household and, in theory, reflects the quality of the median home—wealthier areas would theoretically have higher homeowners' premiums. Finally, I included population density to capture storm effectiveness. For example, if the same storm hits both Wyoming and New York, we would expect more damage in New York simply because it has a higher probability of impacting densely populated areas compared to Wyoming.
+
+However, there’s an issue with how highly correlated the last three explanatory variables are. `PriceDef` and `MedianHomeIncome` have a correlation of about 0.80, which is definitely a problem I need to address. The challenge is that both variables seem necessary for controlling key factors in my model. One potential solution is to replace median household income with average home prices, but I suspect I’d run into the same correlation issue since both prices and incomes have been steadily increasing since 2008. If I drop either variable from the `splm` models, the results remain about the same. Population density is correlated at ~0.50 with the price-related variables, but I don’t see `PopDensity` as essential compared to the others, especially if I opt for a fixed-effects model. That said, dropping `PopDensity` won’t resolve the correlation issue between `PriceDef` and `MedianHomeIncome`.
+
+```{r}
+# Subset the relevant variables
+vars <- st_drop_geometry(model_ready_scaled)[, c("homePrems", "home_damage", "disaster_damage", "MedHomeIncome","PriceDef", "PopDensity")]
+
+# Compute the correlation matrix
+cor_matrix <- cor(vars, use = "pairwise.complete.obs")
+
+corrplot(cor_matrix, method = "circle", type = "full", 
+         addgrid.col = "black", # Add a grid in black color
+         tl.cex = 0.8,          # Adjust text label size
+         tl.col = "black",      # Label color
+         cl.cex = 0.8,          # Color legend size
+         diag = TRUE)  
+```
+
+
+Below are graphs that show the best functional form of each variable.
+
+```{r}
+ggplot(model_ready, aes(PriceDef, homePrems)) +
+  geom_point(color = "darkblue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  # Use a single color for the regression line
+  labs(
+    title = "Average Homeowners Premiums vs PriceDef",
+    x = "PriceDef",
+    y = "Average Premiums"
+  )
+```
+
+
+```{r}
+ggplot(model_ready, aes(log(home_damage), homePrems)) +
+  geom_point(color = "darkblue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  # Use a single color for the regression line
+  labs(
+    title = "Average Homeowners Premiums vs log(home_damage)",
+    x = "log(home_damage)",
+    y = "Average Premiums"
+  )
+```
+
+```{r}
+ggplot(model_ready, aes(log(disaster_damage), homePrems)) +
+  geom_point(color = "darkblue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  # Use a single color for the regression line
+  labs(
+    title = "Average Homeowners Premiums vs log(disaster_damage)",
+    x = "log(disaster_damage)",
+    y = "Average Premiums"
+  )
+```
+
+```{r}
+ggplot(model_ready, aes(log(PopDensity), homePrems, color = as.factor(State))) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  # Use a single color for the regression line
+  labs(
+    title = "Average Homeowners Premiums vs log(PopDensity)",
+    x = "log(PopDensity)",
+    y = "Average Premiums"
+  )
+```
+
+```{r}
+ggplot(model_ready, aes(MedHomeIncome, homePrems)) +
+  geom_point(color = "darkblue") +
+  geom_smooth(method = "lm", formula = y ~ x + I(x^(2)), se = FALSE, color = "red") +  # Use a single color for the regression line
+  labs(
+    title = "Average Homeowners Premiums vs MedHomeIncome",
+    x = "MedHomeIncome",
+    y = "Average Premiums"
+  )
+```
+
+# Linear
+
+I started with a simple linear regression model that found a positive effect from home damage. Moran’s I test indicated evidence of spatial autocorrelation in the model. Additionally, `lm.LMtests()` showed that in this basic model, the lagged effect is stronger than the spatial errors.
+
+```{r}
+lm <- lm(homePrems ~ log(home_damage), data = model_ready_scaled)
+
+#+ Pop_Dis + Uninsured + Medicaid + PriceDef
+#+ 
+summary(lm)
+
+# Extract residuals
+residuals <- residuals(lm)
+
+# Moran's I test on residuals
+moran.test(residuals, weights_across_years, alternative = "greater")
+
+MC <- moran.mc(residuals, weights_across_years, nsim = 999, alternative = "greater") # prefered method 
+
+plot(MC)
+
+LM <- lm.LMtests(lm, weights_across_years, test = "all")
+LM
+```
+
+Looking at a linear regression that includes all explanatory variables, the model still found a positive effect from home damage, but the effect of disaster damage was negative and quite insignificant. Moran’s I remains significant, but this time, `lm.LMtests()` indicated that the spatial error was more significant than the lag.
+```{r}
+lm2 <- lm(homePrems ~ log(home_damage) + log(disaster_damage) + PriceDef + log(PopDensity) + MedHomeIncome + I(MedHomeIncome^2), data = model_ready_scaled)
+
+summary(lm2)
+
+### Moran's I ### which quantifies how similar each region is with its neighbors and averages all these assessments.
+residuals <- residuals(lm)
+
+moran.test(residuals, weights_across_years, alternative = "greater")
+
+MC <- moran.mc(residuals, weights_across_years, nsim = 999, alternative = "greater") # prefered method 
+
+plot(MC)
+
+LM <- lm.LMtests(lm2, weights_across_years, test = "all")
+LM
+```
+
+# Fixed Effects
+
+A big part of last week was deciding whether a fixed effects or random effects model would be more appropriate for what I want to model. Before answering that, let’s examine how each fits the data without spatial weights.  
+
+Looking at a fixed effects model, the results are similar, but with higher standard errors. As a result, this model identifies fewer significant variables compared to the linear models. However, it did find an insignificant Moran’s I. Since I’m interested in spatial relationships, this model doesn’t correctly fit the data. Additionally, the `panel_lme()` and `panel_lml()` functions provided evidence of spatial lags and errors, with errors being more significant again. 
+```{r}
+### FIXED EFFECTS MODEL ###
+fixed_effects_model <- plm(
+  homePrems ~ log(home_damage) + log(disaster_damage) + PriceDef + log(PopDensity) + MedHomeIncome + I(MedHomeIncome^2), data = model_ready_scaled, index = c("State", "Year"), model = "within", effect = "twoways")
+
+# Model Summary
+summary(fixed_effects_model)
+
+### Moran's I ###
+# Extract residuals from the fixed effects model
+residuals_fixed_effects <- residuals(fixed_effects_model)
+
+# Moran's I test on residuals
+moran.test(residuals_fixed_effects, weights_across_years, alternative = "greater")
+
+# Moran's I permutation test (preferred method)
+MC <- moran.mc(residuals_fixed_effects, weights_across_years, nsim = 999, alternative = "greater")
+plot(MC)
+
+fixed_test<- homePrems ~ log(home_damage) + log(disaster_damage) + PriceDef + log(PopDensity) + MedHomeIncome + I(MedHomeIncome^2) + Coastal
+slmtest(fixed_test, model_ready_scaled, lw, test = c("rlme"), index = c("State", "Year"), model = "pooling") 
+slmtest(fixed_test, model_ready_scaled, lw, test = c("rlml"), index = c("State", "Year"), model = "pooling") #"lme","lml","rlme","rlml"
+
+```
+
+# Mixed Effects Model
+
+The basic mixed effects model is the first to find a negative effect from home damage while still producing a significant Moran’s I.
+
+```{r}
+long_df <- model_ready_scaled %>%
+  mutate(Year_Long = Year - 2008)
+#random slopes and intercepts, Homeowners 
+mixedeffects3 <- lmer(homePrems ~ log(home_damage) + (Year_Long|State), REML=T, data = long_df)
+
+summary(mixedeffects3)
+
+### Moran I #### 
+
+# Extract residuals
+residuals <- residuals(mixedeffects3)
+
+# Moran's I test on residuals
+moran.test(residuals, weights_across_years, alternative = "greater")
+
+MC <- moran.mc(residuals, weights_across_years, nsim = 999, alternative = "greater") # prefered method   
+
+plot(MC)
+```
+
+Even with the other explanatory variables added, the results differ from the previous models. I believe this is due to the assumptions made by mixed effects models, specifically that random effects are uncorrelated with the other explanatory variables. For this reason, my final model will include fixed effects rather than random effects. However, I also include spatial models with random effects to demonstrate that the specification does not significantly change the results when I account for spatial errors.
+
+```{r}
+# Fit the mixed effects model
+mixedeffects <- lmer(homePrems ~ log(home_damage) + log(disaster_damage) + PriceDef + log(PopDensity) + MedHomeIncome + I(MedHomeIncome^2) + (Year_Long|State) + Year_Long, REML = TRUE, data = long_df)
+
+# Summary of the model
+summary(mixedeffects)
+
+### Moran I ###
+# Extract residuals from the mixed effects model
+residuals_mixedeffects <- residuals(mixedeffects)
+
+# Moran's I test on residuals
+moran.test(residuals_mixedeffects, weights_across_years, alternative = "greater")
+
+# Moran's I permutation test (preferred method)
+MC <- moran.mc(residuals_mixedeffects, weights_across_years, nsim = 999, alternative = "greater")
+plot(MC)
+```
+
+# Lagsarlm and Errorsarlm Models
+
+I did these models based of the these two articles you sent me:
+
+https://crd230.github.io/lab8.html#Lagrange_Multiplier_test & https://www.emilyburchfield.org/courses/gsa/spatial_regression_lab. 
+
+Surprisingly, both models produced similar results. Both produced significant spatial parameters(lambda and rho). To me this shows that there is a need to account for both spatial lag and error, however it appears to be frowned upon to account for both. So based on the majority of the previous tests, I will stick with a spatial error model and put spatial lag models and a full spatial lag and error model (SARMA) in the appendix. 
+
+```{r}
+lag_model <- lagsarlm(homePrems ~ log(home_damage) + log(disaster_damage) + PriceDef + log(PopDensity) + MedHomeIncome + I(MedHomeIncome^2) + as.factor(State) + as.factor(Year), data = model_ready_scaled,  listw = listw2U(weights_across_years), zero.policy = TRUE)
+
+summary(lag_model)
+
+fit.lag.effects <- impacts(lag_model, listw = listw2U(weights_across_years), R = 999)
+summary(fit.lag.effects, zstats = TRUE, short = TRUE)
+```
+
+```{r}
+fit.err <- errorsarlm(homePrems ~ log(home_damage) + log(disaster_damage) + PriceDef + log(PopDensity) + MedHomeIncome + I(MedHomeIncome^2) + as.factor(State) + as.factor(Year), data = model_ready_scaled,  listw = listw2U(weights_across_years), zero.policy = TRUE)
+
+summary(fit.err)
+```
+
+# Spatial Panel Models
+
+As stated earlier, I include both random effects and fixed effects to show that the results are robust to this specification choice. Additionally, I use `sphtest()` to further justify that fixed effects better fit the data. Based on this https://libguides.princeton.edu/R-Panel?utm_source=chatgpt.com, the significant p-values indicate that fixed effects are the better choice in this case.  
+
+The four models below demonstrate consistent results, regardless of whether random or fixed effects are used. Aside from the mixed effects models, most models show a positive effect for damage covered by homeowners insurance and a negative effect for damage not covered. I’m not yet sure if the latter result makes sense, but the former is an exciting finding at this stage. When I remove disaster damage from the model, I still find a significant positive effect from `home_damage`.  
+
+As I dive deeper into the literature on the relationship between homeowners' premiums and weather-related damages, I aim to refine my reasoning and explore new control variables for my model. If my understanding of the models is correct, I believe I’m in a strong position to fine-tune the analysis effectively. 
+
+
+```{r}
+panel_data <- model_ready 
+
+# Scale variables
+panel_data_scaled <- panel_data %>%
+  mutate(across(c(homePrems, HealthcareExp, Pop18_64, Uninsured, Medicaid, PriceDef, disaster_damage, PopDensity, Total_Residents, td_per_cap, MedHomeIncome, home_damage), 
+                ~ {
+                  scaled_value <- (.-min(.)) / (max(.) - min(.))
+                  scaled_value[scaled_value == 0] <- 0.00000000000001
+                  scaled_value
+                }))
+```
+
+```{r}
+# Base Random Effects Spatial Error Model
+
+BMR <- spml(homePrems ~ log(home_damage), 
+           data = panel_data_scaled, 
+           index = c("State", "Year"),
+           listw = lw,
+           model = "random",
+           effect = "individual",
+           lag = FALSE,
+           spatial.error=c("b"))
+
+summary(BMR)
+```
+
+```{r}
+# Base Fixed Effects Spatial Error Model
+
+BMF <- spml(homePrems ~ log(home_damage), 
+                   data = panel_data_scaled, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "twoways",
+                   lag = FALSE,
+                   spatial.error = "b")
+
+summary(BMF)
+```
+
+
+```{r}
+# Full Random Spatial Error Model
+
+FMR <- spml(homePrems ~ log(home_damage) + log(disaster_damage) + PriceDef + log(PopDensity) + MedHomeIncome + I(MedHomeIncome^2),
+           data = panel_data_scaled, 
+           index = c("State", "Year"),
+           listw = lw,
+           model = "random",
+           effect = "individual",
+           lag = FALSE,
+           spatial.error=c("b"))
+
+summary(FMR)
+```
+
+```{r}
+################# FINAL MODEL #######################
+
+FMF <- spml(homePrems ~ log(home_damage) + log(disaster_damage) + PriceDef + log(PopDensity) + MedHomeIncome + I(MedHomeIncome^2),
+                   data = panel_data_scaled, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "twoways",
+                   lag = FALSE,
+                   spatial.error = "b")
+summary(FMF)
+```
+
+```{r}
+#If p-value is significant, use a fixed effects model
+
+sphtest(FMF,FMR)
+```
+
+# Appendix 
+
+## Spatial Lag Models
+
+The four splm models but now as a spatial lag model. The signs for the coeffiecents are still the same (besides the full random effect model), however the standard errors have changed, drastically in some of the models. 
+
+```{r}
+# spatial mixed effects model, base
+BMR <- spml(homePrems ~ log(home_damage), 
+           data = panel_data_scaled, 
+           index = c("State", "Year"),
+           listw = lw,
+           model = "random",
+           effect = "individual",
+           lag = TRUE,
+           spatial.error=c("none"))
+
+summary(BMR)
+```
+
+```{r}
+# Spatial fixed effects model with both State and Year fixed effects
+BMF <- spml(homePrems ~ log(home_damage), 
+                   data = panel_data_scaled, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "twoways",
+                   lag = TRUE,
+                   spatial.error = "none")
+
+summary(BMF)
+```
+
+
+```{r}
+# spatial mixed effects model, homeowners
+FMR <- spml(homePrems ~ log(home_damage) + log(disaster_damage) + PriceDef + log(PopDensity) + MedHomeIncome + I(MedHomeIncome^2),
+           data = panel_data_scaled, 
+           index = c("State", "Year"),
+           listw = lw,
+           model = "random",
+           effect = "individual",
+           lag = FALSE,
+           spatial.error=c("none"))
+
+summary(FMR)
+```
+
+```{r}
+# spatial mixed effects model, homeowners
+FMF <- spml(homePrems ~ log(home_damage) + log(disaster_damage) + PriceDef + log(PopDensity) + MedHomeIncome + I(MedHomeIncome^2),
+                   data = panel_data_scaled, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "twoways",
+                   lag = TRUE,
+                   spatial.error = "none")
+summary(FMF)
+```
+
+```{r}
+#If p-value is significant, use a fixed effects model
+
+sphtest(FMF,FMR)
+```
+
+## SARMA MODEL
+
+I do think this model should be looked at more, the error term (rho) is suprisingly insignificant while the lagged term (lambda) is significant. Why this model produces this result is not clear to me, but it is interesting that the coefficients produce the similar results to the rest of the models. 
+
+```{r}
+# spatial mixed effects model, homeowners
+FMF <- spml(homePrems ~ log(home_damage) + log(disaster_damage) + PriceDef + log(PopDensity) + MedHomeIncome + I(MedHomeIncome^2),
+                   data = panel_data_scaled, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "twoways",
+                   lag = TRUE,
+                   spatial.error = "b")
+summary(FMF)
+```

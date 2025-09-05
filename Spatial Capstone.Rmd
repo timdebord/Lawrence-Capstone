@@ -1,0 +1,1257 @@
+---
+title: "Spatial Storms"
+output: html_document
+date: "2025-01-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(ggplot2)
+library(tidyverse)
+library(dplyr)
+library(stargazer)
+library(knitr)
+library(kableExtra)
+library(plm)
+library(lme4)
+library(sf)
+library(leaflet)
+library(spdep)
+library(spatialreg)
+library(sp)
+library(terra)
+library(tmap)
+library(splm)
+library(plm)
+library(corrplot)
+library(gridExtra)
+```
+
+# merging base data
+
+```{r}
+# Read CSV files
+file1 <- read.csv("C:/Users/timmy/Desktop/School Files/Capstone/Usable CSVs/Finished Ind CSVs/Adults Uninsured .csv")
+file2 <- read.csv("C:/Users/timmy/Desktop/School Files/Capstone/Usable CSVs/Finished Ind CSVs/Health Care Expenditures per Capita by State of Residence  1991-2020.csv")
+file3 <- read.csv("C:/Users/timmy/Desktop/School Files/Capstone/Usable CSVs/Finished Ind CSVs/Population Dist.csv")
+file4 <- read.csv("C:/Users/timmy/Desktop/School Files/Capstone/Usable CSVs/Finished Ind CSVs/Health Ins Coverage .csv")
+file5 <- read.csv("C:/Users/timmy/Desktop/School Files/Capstone/Usable CSVs/Finished Ind CSVs/Regional Price Deflator .csv")
+file7 <- read.csv("C:/Users/timmy/Desktop/School Files/Capstone/Usable CSVs/Finished Ind CSVs/Premiums.csv") 
+file8 <- read.csv("C:/Users/timmy/Desktop/School Files/Capstone/Usable CSVs/Finished Ind CSVs/Population Totals.csv") #KFF
+file9 <- read.csv("C:/Users/timmy/Desktop/School Files/Capstone/Usable CSVs/Finished Ind CSVs/Median Household Income.csv") #file9 comes from census bureau
+file10 <- read.csv("C:/Users/timmy/Desktop/School Files/Capstone/Usable CSVs/Finished Ind CSVs/Percent White.csv") # KFF
+file11 <- read.csv("C:/Users/timmy/Desktop/School Files/Capstone/Usable CSVs/Finished Ind CSVs/Average Home Price.csv")
+file12 <- read.csv("C:/Users/timmy/Desktop/School Files/Capstone/Usable CSVs/Finished Ind CSVs/Natural Hazards 2.csv")
+# Zillow
+
+file7$State <- as.character(file7$State)
+file7$Renters.Avg.Premium <- as.numeric(file7$Renters.Avg.Premium)
+
+file7$State <- str_trim(file7$State)
+
+# Perform sequential joins by State and Year
+merged_df <- file1 %>%
+  left_join(file2, by = c("State", "Year")) %>%
+  left_join(file3, by = c("State", "Year")) %>%
+  left_join(file4, by = c("State", "Year")) %>%
+  left_join(file5, by = c("State", "Year")) %>% 
+  left_join(file7, by = c("State", "Year")) %>% 
+  left_join(file8, by = c("State", "Year")) %>% 
+  left_join(file9, by = c("State", "Year")) %>% 
+  left_join(file10, by = c("State", "Year")) %>% 
+  left_join(file11, by = c("State", "Year")) %>% 
+  left_join(file12, by = c("State"))
+
+merged_df$Year <- as.factor(merged_df$Year)
+
+medicaid_df <- subset(merged_df, Type == "Medicaid")
+
+pop_df <- medicaid_df %>%
+  filter(Age.Range %in% c("Adults 19-25", "Adults 26-34", "Adults 35-54", "Adults 55-64")) %>%
+  group_by(State, Year) %>%
+  summarize(Total_Pop_Dis = sum(Pop.Dis, na.rm = TRUE),       # Sum of Pop.Dis for each State and Year group
+            .groups = 'drop') %>%
+  left_join(select(medicaid_df, -Age.Range, -Pop.Dis), by = c("State", "Year")) %>%
+  distinct()
+
+pop_df$State <- as.factor(pop_df$State)
+pop_df$Year <- as.factor(pop_df$Year)
+pop_df$Percent <- as.numeric(pop_df$Percent)
+
+# Vector of coastal states
+coastal_states <- c("Alabama", "Alaska", "California", "Connecticut", "Delaware", 
+                    "Florida", "Georgia", "Hawaii", "Louisiana", "Maine", 
+                    "Maryland", "Massachusetts", "Mississippi", "New Hampshire", 
+                    "New Jersey", "New York", "North Carolina", "Oregon", 
+                    "Rhode Island", "South Carolina", "Texas", "Virginia", 
+                    "Washington")
+
+pop_df$Is_Coastal <- ifelse(pop_df$State %in% coastal_states, 1, 0)
+
+###################################################################################################################################
+
+file6 <- read.csv("C:/Users/timmy/Desktop/School Files/Capstone/Usable CSVs/Finished Ind CSVs/Storm_Data_final_filtered.csv")
+
+file6$State <- str_to_title(file6$State)
+file6$State <- as.factor(file6$State)
+file6$Year <- as.factor(file6$Year)
+
+convert_damage <- function(x) {
+  if (x == "") return(NA) 
+  if (grepl("K", x)) {
+    return(as.numeric(gsub("K", "", x)) * 1000) 
+  } else if (grepl("M", x)) {
+    return(as.numeric(gsub("M", "", x)) * 1000000) 
+  } else {
+    return(as.numeric(x)) 
+  }
+}
+
+# Step 1: Convert damage columns
+file6$DAMAGE_PROPERTY <- sapply(file6$DAMAGE_PROPERTY, convert_damage)
+file6$DAMAGE_CROPS <- sapply(file6$DAMAGE_CROPS, convert_damage)
+
+# Step 2: Group by State, Year, and EVENT_TYPE to count occurrences
+event_counts <- file6 %>%
+  group_by(State, Year, EVENT_TYPE) %>%
+  summarise(
+    count = n(),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = EVENT_TYPE,
+    values_from = count,
+    values_fill = list(count = 0)  # Fill missing counts with 0
+  )
+
+# Step 3: Summarize DAMAGE_PROPERTY and DAMAGE_CROPS by State, Year, and EVENT_TYPE
+damage_by_event <- file6 %>%
+  group_by(State, Year, EVENT_TYPE) %>%
+  summarise(
+    damage_property = sum(DAMAGE_PROPERTY, na.rm = TRUE),
+    damage_crops = sum(DAMAGE_CROPS, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = EVENT_TYPE,
+    values_from = c(damage_property, damage_crops),
+    values_fill = list(damage_property = 0, damage_crops = 0)  # Fill missing values with 0
+  )
+
+# Step 4: Summarize total damage for each state and year
+damage_totals <- file6 %>%
+  group_by(State, Year) %>%
+  summarise(
+    total_damage_property = sum(DAMAGE_PROPERTY, na.rm = TRUE),
+    total_damage_crops = sum(DAMAGE_CROPS, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Step 5: Merge everything together
+final_data <- event_counts %>%
+  left_join(damage_totals, by = c("State", "Year")) %>%
+  left_join(damage_by_event, by = c("State", "Year"))
+
+final_data <- final_data %>%
+  rename_with(~ str_replace_all(str_to_lower(.), " ", "_")) %>% 
+  rename(
+    State = state,
+    Year = year
+  )
+
+# Step 3: Merge the two summaries
+summarized_data <- final_data %>%
+  left_join(damage_totals, by = c("State", "Year"))
+
+######################################################################################################################
+
+summarized_data$State <- as.factor(summarized_data$State)
+summarized_data$Year <- as.factor(summarized_data$Year)
+
+storms_sf_final <- pop_df %>%
+  inner_join(summarized_data, by = c("State", "Year"))
+
+storms_sf_final$Year <- as.factor(storms_sf_final$Year)
+
+save_data <- storms_sf_final
+
+write.csv(save_data, "C:/Users/timmy/Desktop/School Files/Capstone/Final CSVs/Final Spatial Data Natural Hazards.csv", row.names = FALSE)
+```
+
+
+# Spatial Adventures
+
+```{r}
+df <- read.csv("C:/Users/timmy/Desktop/School Files/Capstone/Final CSVs/Final Spatial Data Percent White Update.csv")
+states_sf <- st_read("C:/Users/timmy/Desktop/School Files/Capstone/tl_2024_us_state.shp", promote_to_multi = FALSE)
+
+df$State <- as.factor(df$State)
+```
+
+```{r}
+#states_sf <- st_cast(states_sf, "POLYGON")
+
+states_sf <- states_sf %>%
+  rename(State = NAME)
+
+# Temporarily save geometry and attributes separately
+geometry <- st_geometry(states_sf)
+attributes <- st_drop_geometry(states_sf)
+
+# Expand attributes to include all years
+expanded_attributes <- attributes %>%
+  mutate(dummy = 1) %>%  
+  expand_grid(Year = 2008:2019) %>%  
+  select(-dummy)  
+
+# Combine expanded attributes with original geometry
+states_sf <- st_sf(expanded_attributes, geometry = rep(geometry, each = length(2008:2019)))
+```
+
+# Data Wrangling
+
+```{r}
+#subset creation for testing
+df_test <- df 
+
+#df_test$DAMAGE_PROPERTY <- df_test$DAMAGE_PROPERTY / 1000
+#df_test$DAMAGE_CROPS <- df_test$DAMAGE_CROPS / 1000
+```
+
+```{r}
+final_df <- states_sf %>%
+  inner_join(df_test, by = c("State", "Year"))
+```
+
+
+```{r}
+# data with geometry
+final_df <- final_df %>%
+  filter(!State %in% c("Hawaii", "Alaska"))
+
+final_df <- final_df %>%
+  select(-total_damage_property.y, -total_damage_crops.y) %>%  # Drop two columns
+  rename(
+    total_damage_property = total_damage_property.x,  # Rename old_name1 to new_name1
+    total_damage_crops = total_damage_crops.x  # Rename old_name2 to new_name2
+  )
+
+model_ready <- final_df %>%
+  arrange(Year, State)  %>% 
+  mutate(total_damage = total_damage_property + total_damage_crops) %>% 
+  mutate(td_per_cap = total_damage / Total_Residents)
+
+model_ready <- model_ready %>%
+  rename(
+    homePrems = Home.Avg.Premium,
+    rentersPrems = Renters.Avg.Premium,
+    HealthcareExp = Health.Spending.per.Capita,
+    Pop18_64 = Total_Pop_Dis,
+    Uninsured = Percent.Adults.19.64.Uninsured,
+    Medicaid = Percent,
+    PriceDef = RegionalPriDef,
+    Coastal = Is_Coastal,
+    MedHomeIncome = Median.Income
+  )
+```
+
+
+```{r}
+# Temporarily drop the geometry column
+geometry <- st_geometry(model_ready)  
+model_ready_no_geom <- model_ready %>%
+  st_drop_geometry()
+
+# Dynamically find the correct column names
+sev_weather_property_cols <- names(model_ready_no_geom) %>%
+  str_subset("damage_property_(tornado|excessive_heat|heavy_snow|high_wind|hail|winter_storm|blizzard|ice_storm|strong_wind|lightning)")
+
+sev_weather_crops_cols <- names(model_ready_no_geom) %>%
+  str_subset("damage_crops_(tornado|excessive_heat|heavy_snow|high_wind|hail|winter_storm|blizzard|ice_storm|strong_wind|lightning)")
+
+disaster_property_cols <- names(model_ready_no_geom) %>%
+  str_subset("damage_property_(hurricane|flood|flash_flood|storm_surge_tide|wildfire|coastal_flood|lakeshore_flood|tsunami)")
+
+disaster_crops_cols <- names(model_ready_no_geom) %>%
+  str_subset("damage_crops_(hurricane|flood|flash_flood|storm_surge_tide|wildfire|coastal_flood|lakeshore_flood|tsunami)")
+
+# Create new storm variables for property and crops
+model_ready_no_geom <- model_ready_no_geom %>%
+  mutate(
+    num_sev_weather_property = rowSums(select(., all_of(sev_weather_property_cols)), na.rm = TRUE),
+    num_sev_weather_crops = rowSums(select(., all_of(sev_weather_crops_cols)), na.rm = TRUE),
+    disasters_property = rowSums(select(., all_of(disaster_property_cols)), na.rm = TRUE),
+    disasters_crops = rowSums(select(., all_of(disaster_crops_cols)), na.rm = TRUE)
+  ) %>%
+  # Sum property and crops together for final values
+  mutate(
+    home_damage = num_sev_weather_property + num_sev_weather_crops,
+    disaster_damage = disasters_property + disasters_crops
+  )
+
+# Add back the geometry column
+model_ready <- st_sf(model_ready_no_geom, geometry = geometry)
+```
+
+```{r}
+# Create vectors for the states and their respective total square miles
+states <- c("Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado", "Connecticut", 
+            "Delaware", "Florida", "Georgia", "Hawaii", "Idaho", "Illinois", "Indiana", 
+            "Iowa", "Kansas", "Kentucky", "Louisiana", "Maine", "Maryland", 
+            "Massachusetts", "Michigan", "Minnesota", "Mississippi", "Missouri", "Montana", 
+            "Nebraska", "Nevada", "New Hampshire", "New Jersey", "New Mexico", "New York", 
+            "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon", "Pennsylvania", 
+            "Rhode Island", "South Carolina", "South Dakota", "Tennessee", "Texas", 
+            "Utah", "Vermont", "Virginia", "Washington", "West Virginia", "Wisconsin", 
+            "Wyoming")
+
+square_miles <- c(52420, 665384, 113990, 53179, 163695, 104094, 5543, 2489, 65758, 59425, 10932, 83569, 
+                  57914, 36420, 56273, 82278, 40408, 52378, 35380, 12406, 10554, 96714, 86936, 48432, 
+                  69707, 147040, 77348, 110572, 9349, 8723, 121590, 54555, 53819, 70698, 44826, 
+                  69899, 98379, 46054, 1545, 32020, 77116, 42144, 268596, 84897, 9616, 42775, 71298, 
+                  24230, 65496, 97813) # Census Bureau 
+
+# Create a vector for the years 2008-2019 repeated for each state
+years <- rep(2008:2019, each = length(states))
+
+# Create the data frame with states, square miles, and years
+state_area <- data.frame(State = rep(states, times = length(2008:2019)),
+                       Square_Miles = rep(square_miles, times = length(2008:2019)),
+                       Year = years)
+
+# Exclude Alaska and Hawaii from the state_area dataset
+state_area <- state_area[!state_area$State %in% c("Alaska", "Hawaii"), ]
+
+model_ready <- model_ready %>% 
+  left_join(state_area, by = c("State", "Year"))
+
+# Create the Population Density variable by dividing Total_Residents by Area_sq_miles
+model_ready$PopDensity <- model_ready$Total_Residents / model_ready$Square_Miles
+
+# Arrange data by Year and State
+model_ready <- model_ready %>%
+  arrange(Year, State)
+```
+
+
+# Neighbours and Weights
+
+```{}
+nb <- model_ready %>%
+  filter(Year %in% c(2011))
+
+# Precompute neighbors from polygon geometries
+basic_neighbors <- poly2nb(nb, queen = FALSE , snap = 0.0001)
+
+centroids <- st_centroid(nb)
+centroids_sp <- as(centroids, "Spatial")
+neighbors <- dnearneigh(centroids_sp, 0, 720)
+
+# Convert neighbors to spatial weights matrix (static for all years)
+lw <- nb2listw(neighbors, style = "W", zero.policy = TRUE) # equal weights (B, W, C, U, S) 
+
+#B is the basic binary coding, W is row standardised (sums over all links to n), C is globally standardised (sums over all links to n), U is equal to C divided by the number of neighbours (sums over all links to unity), while S is the variance-stabilizing coding scheme proposed by Tiefelsdorf et al. 1999, p. 167-168 (sums over all links to n).
+
+# Function to replicate weights and neighbors while maintaining class attributes and style (NOT USED FOR SPATIAL PLM)
+replicate_listw <- function(lw, times) {
+  replicated_weights <- rep(lw$weights, times)
+  replicated_neighbours <- do.call("c", replicate(times, lw$neighbours, simplify = FALSE))
+  
+  # Ensure neighbours has correct nb structure and region.id is a character
+  class(replicated_neighbours) <- class(lw$neighbours)
+  
+  # create listw structure, copying the structure of lw
+  expanded_weights <- list(
+    style = lw$style,  # Place style first
+    neighbours = replicated_neighbours,  # Place neighbours second
+    weights = replicated_weights  # Place weights last
+  )
+  class(expanded_weights) <- class(lw)
+  
+  return(expanded_weights)
+}
+
+# Determine the number of years
+num_years <- length(unique(final_df$Year))
+num_rows <- nrow(final_df)
+num_reps <- num_rows / length(lw$weights)
+
+weights_across_years <- replicate_listw(lw, num_reps)
+
+# Verify the class and summary of the extended listw object and rows num
+print(class(weights_across_years))  
+print(class(weights_across_years$neighbours))  
+print(weights_across_years$style)  
+
+print(length(weights_across_years$weights))  
+print(length(weights_across_years$neighbours)) 
+
+# Plot neighbors connections
+plot(st_geometry(nb), border = "black") # plot polygons with gray borders
+plot(basic_neighbors, st_coordinates(st_centroid(st_geometry(nb))), add = TRUE, col = "blue", lwd = 1.5)
+```
+
+I've started to experiment with different weighting techniques because it makes sense to weight neightbors across boarders that do not touch, i.e. majority of the east coast, and for those weights to be different. 
+
+```{r}
+nb <- model_ready %>%
+  filter(Year %in% c(2011))
+
+centroids <- st_centroid(nb)  # This should already be in 'sf' format
+
+centroids_sp <- as(centroids, "Spatial")
+
+dist_matrix <- spDists(centroids_sp)
+
+neighbors <- dnearneigh(centroids_sp, 0, 720)  # You can adjust this threshold
+
+lw <- nb2listw(neighbors, style = "B", zero.policy = TRUE)  # Use binary weights first
+
+# Inverse distance weighting
+for (i in 1:length(neighbors)) {
+  neighbor_indices <- neighbors[[i]]
+  total_weight <- 0
+  for (j in 1:length(neighbor_indices)) {
+    distance <- dist_matrix[i, neighbor_indices[j]]
+    if (!is.na(distance) && distance != 0) {
+      weight <- 1 / distance
+      lw$weights[[i]][j] <- weight
+      total_weight <- total_weight + weight
+    } else {
+      lw$weights[[i]][j] <- 0
+    }
+  }
+  # Normalize weights
+  if (total_weight != 0) {
+    lw$weights[[i]] <- lw$weights[[i]] / total_weight
+  }
+}
+
+# Function to replicate weights and neighbors while maintaining class attributes and style (NOT USED FOR SPATIAL PLM)
+replicate_listw <- function(lw, times) {
+  replicated_weights <- rep(lw$weights, times)
+  replicated_neighbours <- do.call("c", replicate(times, lw$neighbours, simplify = FALSE))
+  
+  # Ensure neighbours has correct nb structure and region.id is a character
+  class(replicated_neighbours) <- class(lw$neighbours)
+  
+  # create listw structure, copying the structure of lw
+  expanded_weights <- list(
+    style = lw$style,  # Place style first
+    neighbours = replicated_neighbours,  # Place neighbours second
+    weights = replicated_weights  # Place weights last
+  )
+  class(expanded_weights) <- class(lw)
+  
+  return(expanded_weights)
+}
+
+# Determine the number of years
+num_years <- length(unique(final_df$Year))
+num_rows <- nrow(final_df)
+num_reps <- num_rows / length(lw$weights)
+
+weights_across_years <- replicate_listw(lw, num_reps)
+```
+
+
+```{r}
+#neighbor exploration
+neighbors[[30]] 
+model_ready$State[c(6 , 7 ,17 ,18 ,19 ,27 ,28 ,33 ,36 ,37 ,43 ,44 ,46)] # adjust based on neighbors[[i]]
+```
+
+```{r}
+#weights exploration
+lw$weights[[30]]
+```
+
+```{r}
+# Plot neighbors connections
+plot(st_geometry(nb), border = "black") # plot polygons with gray borders
+plot(neighbors, st_coordinates(st_centroid(st_geometry(nb))), add = TRUE, col = "blue", lwd = 1.5)
+```
+
+```{}
+#Global space heterogeniety 
+#Sherrie Xie at Post-doctoral research fellow at the University of Pennsylvania gave a workshop at the R/Medicine 2022 Virtual Conference.
+
+moran.test(model_ready$homePrems, weights_across_years, alternative = "greater") # faster less accurate
+
+MC <- moran.mc(model_ready$homePrems, weights_across_years, nsim = 999, alternative = "greater") # prefered method   
+
+MC
+
+plot(MC) # evidence of a clustering
+```
+
+# maps/ data prep
+```{r}
+model_ready_scaled <- model_ready %>%
+  mutate(across(c(homePrems, total_damage, HealthcareExp, Pop18_64, Uninsured, Medicaid, PriceDef, disaster_damage, PopDensity, td_per_cap, MedHomeIncome, home_damage, Percent_white), 
+                ~ {
+                  scaled_value <- (.-min(.)) / (max(.) - min(.))
+                  scaled_value[scaled_value == 0] <- 0.00000000000001
+                  scaled_value
+                }))
+```
+
+```{}
+# Aggregate the total damage by state while keeping geometry
+state_damage <- model_ready %>%
+  group_by(State) %>%
+  summarise(Total_Home_Damage = sum(home_damage, na.rm = TRUE),
+             Total_Diaster_Damage = mean(disaster_damage, na.rm = TRUE), 
+            geometry = st_union(geometry)) %>%
+  ungroup()
+
+# Create a leaflet map
+leaflet(state_damage) %>%
+  addTiles() %>%  # Add base tiles
+  addPolygons(fillColor = ~colorQuantile("YlOrRd", Total_Home_Damage)(Total_Home_Damage),
+              color = "black", weight = 1, fillOpacity = 0.7,
+              popup = ~paste(State, "<br> Total Damage: ", Total_Home_Damage)) %>%
+  addLegend("bottomright", 
+            pal = colorNumeric("YlOrRd", state_damage$Total_Home_Damage, n = 8),
+            values = state_damage$Total_Home_Damage,
+            title = "Total Home Damage",
+            opacity = 1)
+
+# Create a leaflet map
+leaflet(state_damage) %>%
+  addTiles() %>%  # Add base tiles
+  addPolygons(fillColor = ~colorQuantile("YlOrRd", Total_Diaster_Damage)(Total_Diaster_Damage), # colorQuantile divides the values 5 quantile groups 
+              color = "black", weight = 1, fillOpacity = 0.7,
+              popup = ~paste(State, "<br> Damage Per Capita: ", Total_Diaster_Damage)) %>%
+  addLegend("bottomright", 
+            pal = colorQuantile("YlOrRd", state_damage$Total_Diaster_Damage, n = 5),
+            values = state_damage$Total_Diaster_Damage,
+            title = "Total Damage by Natural Diasters",
+            opacity = 1)
+```
+
+```{r}
+# Subset the relevant variables
+vars <- st_drop_geometry(model_ready_scaled)[, c("homePrems", "home_damage", "disaster_damage", "MedHomeIncome","PriceDef", "PopDensity", "Percent_white")]
+
+# Compute the correlation matrix
+cor_matrix <- cor(vars, use = "pairwise.complete.obs")
+
+corrplot(cor_matrix, method = "circle", type = "full", 
+         addgrid.col = "black", # Add a grid in black color
+         tl.cex = 0.8,          # Adjust text label size
+         tl.col = "black",      # Label color
+         cl.cex = 0.8,          # Color legend size
+         diag = TRUE)  
+```
+
+As of now I have nothing to back the reasons I picked these other than my own logic, with that in mind:
+Outcome Var: Homeowners Premiums
+Treatments (var of interest): damage per capita and number of severe weather events 
+Controls: Price Deflator, indirect measure of inflation
+          Median Household Income, measures the social-economic status of the median household
+          Population Density, main idea being the more people per square mile the more damage a storm would cause when compared to a less dense area
+          Coastal? I am currently not sure about including this one, leaning towards not including it. 
+          
+```{r}
+ggplot(model_ready, aes(log(home_damage), homePrems)) +
+  geom_point(color = "darkblue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  # Use a single color for the regression line
+  labs(
+    title = "Average Homeowners Premiums vs log(home_damage)",
+    x = "home_damage",
+    y = "Average Premiums"
+  )
+```
+
+```{r}
+ggplot(model_ready, aes(log(disaster_damage), homePrems)) +
+  geom_point(color = "darkblue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  # Use a single color for the regression line
+  labs(
+    title = "Average Homeowners Premiums vs disaster_damage",
+    x = "disaster_damage",
+    y = "Average Premiums"
+  )
+```
+
+```{r}
+ggplot(model_ready, aes(PriceDef, homePrems)) +
+  geom_point(color = "darkblue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  # Use a single color for the regression line
+  labs(
+    title = "Average Homeowners Premiums vs PriceDef",
+    x = "PriceDef",
+    y = "Average Premiums"
+  )
+```
+
+```{r}
+ggplot(model_ready, aes(MedHomeIncome, homePrems)) +
+  geom_point(color = "darkblue") +
+  geom_smooth(method = "lm", formula = y ~ x + I(x^(2)), se = FALSE, color = "red") +  # Use a single color for the regression line
+  labs(
+    title = "Average Homeowners Premiums vs MedHomeIncome",
+    x = "MedHomeIncome",
+    y = "Average Premiums"
+  )
+```
+
+```{r}
+medhomeincomegraphn <- model_ready %>%
+  filter(Year %in% c(2011))
+
+ggplot(medhomeincomegraphn, aes(MedHomeIncome, homePrems)) +
+  geom_point(color = "darkblue") +
+  geom_smooth(method = "lm", formula = y ~ x + I(x^(2)), se = FALSE, color = "red") +  # Use a single color for the regression line
+  labs(
+    title = "Average Homeowners Premiums vs MedHomeIncome",
+    x = "MedHomeIncome",
+    y = "Average Premiums"
+  )
+```
+
+
+```{r}
+model_ready <- model_ready %>%
+  mutate(MedHomeIncome_squared = MedHomeIncome^(2))
+
+ggplot(model_ready, aes(MedHomeIncome_squared, homePrems)) +
+  geom_point(color = "darkblue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  labs(
+    title = "Average Homeowners Premiums vs Squared MedHomeIncome",
+    x = "MedHomeIncome_squared",
+    y = "Average Premiums"
+  )
+```
+
+```{r}
+#this looks the same regardless if its squared or not, so does it matter if the basic graph shows the need for a transformation despite the violation of independence?
+
+plot5 <- ggplot(model_ready, aes(MedHomeIncome, homePrems)) + # take 50 points and see
+  geom_point(color = "darkblue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  labs(
+    title = "Average Homeowners Premiums vs Squared MedHomeIncome by State",
+    x = "MedHomeIncome (Squared)",
+    y = "Average Premiums"
+  ) +
+  facet_wrap(~State)
+
+plot5
+```
+
+```{r}
+ggplot(model_ready, aes(log(PopDensity), homePrems, color = as.factor(State))) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  # Use a single color for the regression line
+  labs(
+    title = "Average Homeowners Premiums vs PopDensity",
+    x = "PopDensity",
+    y = "Average Premiums"
+  )
+
+```
+# Linear
+
+```{r}
+lm <- lm(homePrems ~ log(home_damage) + log(disaster_damage), data = model_ready_scaled)
+lm2 <- lm(homePrems ~ log(home_damage)*log(disaster_damage), data = model_ready_scaled)
+
+#+ Pop_Dis + Uninsured + Medicaid + PriceDef
+#+ 
+summary(lm)
+summary(lm2)
+
+lm_aic <- AIC(lm)
+lm_aic
+lm2_aic <- AIC(lm2)
+lm2_aic
+
+# Extract residuals
+residuals <- residuals(lm)
+residuals2 <- residuals(lm2)
+
+# Moran's I test on residuals
+moran.test(residuals, weights_across_years, alternative = "greater")
+moran.test(residuals2, weights_across_years, alternative = "greater")
+
+MC <- moran.mc(residuals, weights_across_years, nsim = 999, alternative = "greater") # prefered method 
+MC2 <- moran.mc(residuals2, weights_across_years, nsim = 999, alternative = "greater") # prefered method 
+
+plot(MC)
+plot(MC2)
+
+LM <- lm.LMtests(lm, weights_across_years, test = "all")
+LM
+```
+
+```{r}
+lm <- lm(homePrems ~ log(home_damage) + log(disaster_damage) + PriceDef + log(PopDensity) + MedHomeIncome + I(MedHomeIncome^2) + Percent_white, data = model_ready_scaled)
+
+summary(lm)
+
+aic <- AIC(lm)
+aic
+bic <- BIC(lm)
+bic
+
+### Moran's I ### which quantifies how similar each region is with its neighbors and averages all these assessments.
+residuals <- residuals(lm)
+
+moran.test(residuals, weights_across_years, alternative = "greater")
+
+MC <- moran.mc(residuals, weights_across_years, nsim = 999, alternative = "greater") # prefered method 
+
+plot(MC)
+
+### MAP ###
+
+model_ready_scaled$residuals <- residuals
+
+grps <- 5 # Number of groups
+brks <- quantile(model_ready_scaled$residuals, probs = seq(0, 1, length.out = grps + 1), na.rm = TRUE)
+colors <- colorRampPalette(c("blue", "orange", "red"))(length(brks) - 1)
+
+ggplot(model_ready_scaled) +
+  geom_sf(aes(fill = cut(residuals, breaks = brks)), color = "black") + # Black borders
+  scale_fill_manual(values = colors, name = "Residuals") +
+  theme_minimal() +
+  labs(title = "Map of Model Residuals", fill = "Residuals")
+```
+```{r}
+LM <- lm.RStests(lm, weights_across_years, test = "all")
+LM
+```
+
+# Fixed Effects
+```{r}
+### FIXED EFFECTS MODEL ###
+fixed_effects_model <- plm(
+  homePrems ~ log(home_damage) + log(disaster_damage) + PriceDef + log(PopDensity) + MedHomeIncome + I(MedHomeIncome^2) + Percent_white, data = model_ready_scaled, index = c("State", "Year"), model = "within", effect = "twoways")
+
+# Model Summary
+summary(fixed_effects_model)
+
+### Moran's I ###
+# Extract residuals from the fixed effects model
+residuals_fixed_effects <- residuals(fixed_effects_model)
+
+# Moran's I test on residuals
+moran.test(residuals_fixed_effects, weights_across_years, alternative = "greater")
+
+# Moran's I permutation test (preferred method)
+MC <- moran.mc(residuals_fixed_effects, weights_across_years, nsim = 999, alternative = "greater")
+plot(MC)
+
+# Extract residuals
+residuals_fixed_effects <- residuals(fixed_effects_model)
+
+# Compute RSS (Residual Sum of Squares)
+RSS <- sum(residuals_fixed_effects^2)
+
+# Number of observations
+n <- nrow(model_ready_scaled)
+
+# Number of parameters (k)
+k <- length(coef(fixed_effects_model))
+
+# Compute log-likelihood approximation
+sigma2 <- RSS / n
+loglik <- -0.5 * n * log(2 * pi * sigma2) - (RSS / (2 * sigma2))
+
+# Compute AIC
+aic <- -2 * loglik + 2 * k
+
+# Compute BIC
+bic <- -2 * loglik + log(n) * k
+
+# Print results
+aic
+bic
+```
+
+```{r}
+fixed_test<- homePrems ~ log(home_damage) + log(disaster_damage) + PriceDef + log(PopDensity) + MedHomeIncome + I(MedHomeIncome^2) + Percent_white
+
+panel_lme <- slmtest(fixed_test, model_ready_scaled, lw, test = c("rlme"), index = c("State", "Year"), model = "pooling") 
+panel_lml <- slmtest(fixed_test, model_ready_scaled, lw, test = c("rlml"), index = c("State", "Year"), model = "pooling")#"lme","lml","rlme","rlml"
+panel_lme
+panel_lml
+```
+
+# Mixed Effects
+
+```{r}
+long_df <- model_ready_scaled %>%
+  mutate(Year_Long = Year - 2008)
+```
+
+```{r}
+#random slopes and intercepts, Homeowners 
+mixedeffects3 <- lmer(homePrems ~ log(home_damage) + log(disaster_damage) + (Year_Long|State), REML=T, data = long_df)
+
+summary(mixedeffects3)
+
+### Moran I #### 
+
+# Extract residuals
+residuals <- residuals(mixedeffects3)
+
+# Moran's I test on residuals
+moran.test(residuals, weights_across_years, alternative = "greater")
+
+MC <- moran.mc(residuals, weights_across_years, nsim = 999, alternative = "greater") # prefered method   
+
+plot(MC)
+
+aic <- AIC(mixedeffects3)
+bic <- BIC(mixedeffects3)
+aic
+bic
+```
+
+```{r}
+# Fit the mixed effects model
+mixedeffects <- lmer(homePrems ~ log(home_damage) + log(disaster_damage) + PriceDef + log(PopDensity) + MedHomeIncome + I(MedHomeIncome^2) + Percent_white + (Year_Long|State) + Year_Long, REML = TRUE, data = long_df)
+
+# Summary of the model
+summary(mixedeffects)
+
+# AIC value
+aic <- AIC(mixedeffects)
+bic <- BIC(mixedeffects)
+aic
+bic
+
+### Moran I ###
+# Extract residuals from the mixed effects model
+residuals_mixedeffects <- residuals(mixedeffects)
+
+# Moran's I test on residuals
+moran.test(residuals_mixedeffects, weights_across_years, alternative = "greater")
+
+# Moran's I permutation test (preferred method)
+MC <- moran.mc(residuals_mixedeffects, weights_across_years, nsim = 999, alternative = "greater")
+plot(MC)
+
+### MAP ###
+# Add residuals to the dataframe for mapping
+long_df$residuals <- residuals_mixedeffects
+
+# Define breaks and colors for the map
+grps <- 10  # Number of groups
+brks <- quantile(long_df$residuals, probs = seq(0, 1, length.out = grps + 1), na.rm = TRUE)
+colors <- colorRampPalette(c("blue", "orange", "red"))(length(brks) - 1)
+
+# Create a map of model residuals
+ggplot(long_df) +
+  geom_sf(aes(fill = cut(residuals, breaks = brks)), color = "black") + # Black borders
+  scale_fill_manual(values = colors, name = "Residuals") +
+  theme_minimal() +
+  labs(title = "Map of Model Residuals", fill = "Residuals")
+
+### QQ Plot ###
+# Standardize residuals (if not already scaled)
+scaled_residuals <- scale(residuals_mixedeffects)
+
+# Extract fitted values from the mixed effects model
+fitted_values_mixedeffects <- fitted(mixedeffects)
+
+# P1: Residual vs Fitted Values
+P1 <- ggplot(data = data.frame(residuals = residuals_mixedeffects, fitted = fitted_values_mixedeffects), aes(y = residuals, x = fitted)) +
+  geom_point() +
+  ggtitle("Residual Plot") +
+  xlab("Predicted Values") +
+  ylab("Residuals")
+
+# P2: Histogram of Residuals
+P2 <- ggplot(data = data.frame(residuals = residuals_mixedeffects), aes(x = residuals)) +
+  geom_histogram() +
+  ggtitle("Histogram of Residuals") +
+  xlab("Residuals")
+
+# P3: QQ Plot for Residuals
+P3 <- ggplot(data = data.frame(residuals = scaled_residuals), aes(sample = residuals)) +
+  stat_qq() +
+  stat_qq_line() +
+  xlab("Normal Quantiles") +
+  ylab("Residual Quantiles") +
+  ggtitle("QQ Plot")
+
+# Combine all three plots into one grid
+grid.arrange(P1, P2, P3, ncol = 3)
+```
+
+# Lagsarlm Models
+
+```{r}
+model <- lagsarlm(homePrems ~ log(home_damage) + log(disaster_damage) + PriceDef + log(PopDensity) + MedHomeIncome + I(MedHomeIncome^2) + Percent_white + as.factor(State) + as.factor(Year), data = model_ready_scaled,  listw = listw2U(weights_across_years), zero.policy = TRUE)
+
+summary(model)
+
+fit.err <- errorsarlm(homePrems ~ log(home_damage) + log(disaster_damage) + PriceDef + log(PopDensity) + MedHomeIncome + I(MedHomeIncome^2) + Percent_white + as.factor(State) + as.factor(Year), data = model_ready_scaled,  listw = listw2U(weights_across_years), zero.policy = TRUE)
+
+summary(fit.err)
+```
+
+
+
+# Mixed Effects With Spatial Weights
+
+```{r}
+panel_data <- model_ready 
+
+### Lags ###
+
+lag_total_damage <- lag(weights_across_years, panel_data$total_damage)
+lag_PopDensity <- lag(weights_across_years, panel_data$PopDensity)
+lag_td_per_cap <- lag(weights_across_years, panel_data$td_per_cap)
+lag_PriceDef <- lag(weights_across_years, panel_data$PriceDef)
+
+# Scale variables
+panel_data_scaled <- panel_data %>%
+  mutate(across(c(homePrems, HealthcareExp, Pop18_64, Uninsured, Medicaid, PriceDef, disaster_damage, PopDensity, Total_Residents, td_per_cap, MedHomeIncome, home_damage, Percent_white), 
+                ~ {
+                  scaled_value <- (.-min(.)) / (max(.) - min(.))
+                  scaled_value[scaled_value == 0] <- 0.00000000000001
+                  scaled_value
+                }))
+```
+
+```{r}
+# spatial mixed effects model, base
+BMR <- spml(homePrems ~ log(home_damage) + log(disaster_damage), 
+           data = panel_data_scaled, 
+           index = c("State", "Year"),
+           listw = lw,
+           model = "random",
+           effect = "individual",
+           lag = FALSE,
+           spatial.error=c("b"))
+
+summary(BMR)
+
+#phi :  (random effects variance): If the random effects variance (phi) were null (phi = 0), it would mean that there's no significant variation between the groups (in this case, states), and a pooled model (without random effects) could be more appropriate.
+
+#lambda : (spatial lag coefficient): If the spatial lag coefficient (lambda) were null (lambda = 0), it would suggest no spatial autocorrelation in the dependent variable, meaning that the spatial structure does not add significant explanatory power to the model.
+
+# Extract log-likelihood
+loglik <- BMR[["logLik"]]
+
+# Number of parameters (k)
+k <- length(coef(BMR)) # Coefficients + lag term
+n <- nrow(panel_data_scaled) # Coefficients + lag term
+
+# Calculate AIC manually
+aic <- -2 * loglik + 2 * k
+aic
+bic <- -2 * loglik + log(n) * loglik
+bic
+
+### Moran I ###
+
+# Extract residuals
+residuals <- residuals(BMR)
+
+# Moran's I test on residuals
+moran.test(residuals, weights_across_years, alternative = "greater")
+
+MC <- moran.mc(residuals, weights_across_years, nsim = 999, alternative = "greater") # prefered method   
+
+plot(MC)
+```
+
+```{r}
+# Spatial fixed effects model with both State and Year fixed effects
+BMF <- spml(homePrems ~ log(home_damage) + log(disaster_damage), 
+                   data = panel_data_scaled, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "twoways",
+                   lag = FALSE,
+                   spatial.error = "b")
+
+summary(BMF)
+
+ eff <- effects(BMF)
+ eff
+ 
+ # Extract log-likelihood
+loglik <- BMF[["logLik"]]
+
+# Number of parameters (k)
+k <- length(coef(BMF)) # Coefficients + lag term
+n <- nrow(panel_data_scaled) # Coefficients + lag term
+
+# Calculate AIC manually
+aic <- -2 * loglik + 2 * k
+aic
+bic <- -2 * loglik + log(n) * loglik
+bic
+```
+
+
+```{r}
+# spatial mixed effects model, homeowners
+FMR <- spml(homePrems ~ log(home_damage) + log(disaster_damage) + PriceDef + log(PopDensity) + MedHomeIncome + I(MedHomeIncome^2) + Percent_white,
+           data = panel_data_scaled, 
+           index = c("State", "Year"),
+           listw = lw,
+           model = "random",
+           effect = "individual",
+           lag = FALSE,
+           spatial.error=c("b"))
+
+summary(FMR)
+
+### AIC TEST ###
+
+# Extract log-likelihood
+loglik <- FMR[["logLik"]]
+
+# Number of parameters (k)
+k <- length(coef(FMR)) # Coefficients + lag term
+n <- nrow(panel_data_scaled) # Coefficients + lag term
+
+# Calculate AIC manually
+aic <- -2 * loglik + 2 * k
+aic
+bic <- -2 * loglik + log(n) * loglik
+bic
+```
+
+```{r}
+# spatial mixed effects model, homeowners
+FMF <- spml(homePrems ~ log(home_damage) + log(disaster_damage) + PriceDef + log(PopDensity) + MedHomeIncome + I(MedHomeIncome^2) + Percent_white,
+                   data = panel_data_scaled, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "twoways",
+                   lag = FALSE,
+                   spatial.error = "b")
+summary(FMF)
+
+### AIC TEST ###
+
+# Extract log-likelihood
+loglik <- FMF[["logLik"]]
+
+# Number of parameters (k)
+k <- length(coef(FMF))
+n <- nrow(panel_data_scaled) # Coefficients + lag term
+
+# Calculate AIC manually
+aic <- -2 * loglik + 2 * k
+aic
+bic <- -2 * loglik + log(n) * loglik
+bic
+
+eff <- effects(FMF)
+eff
+```
+
+```{r}
+#If p-value is significant, use a fixed effects model
+sphtest(BMF,BMR)
+sphtest(FMF,FMR)
+```
+
+```{r}
+#FINAL MODEL#
+# spatial mixed effects model, homeowners
+M1 <- spml(homePrems ~ log(home_damage) + log(disaster_damage) + PriceDef + log(PopDensity) + MedHomeIncome + I(MedHomeIncome^2 + Percent_white),
+                   data = panel_data_scaled, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "twoways",
+                   lag = TRUE,
+                   spatial.error = "b")
+summary(M1)
+
+### AIC TEST ###
+
+# Extract log-likelihood
+loglik <- M1[["logLik"]]
+
+# Number of parameters (k)
+k <- length(coef(M1)) # Coefficients + lag term
+n <- nrow(panel_data_scaled) # Coefficients + lag term
+
+# Calculate AIC manually
+aic <- -2 * loglik + 2 * k
+aic
+bic <- -2 * loglik + log(n) * loglik
+bic
+
+### Moran I ###
+
+# Extract residuals
+residuals <- residuals(M1)
+
+# Moran's I test on residuals
+moran.test(residuals, weights_across_years, alternative = "greater")
+
+MC <- moran.mc(residuals, weights_across_years, nsim = 999, alternative = "greater") # prefered method   
+
+lisa_mc <- localmoran_perm(residuals, weights_across_years, nsim = 999)
+
+plot(MC)
+
+# Attach Local Moran's I results to the spatial dataset
+panel_data_scaled$local_moran <- lisa_mc[, "Ii"]              
+panel_data_scaled$p_value_mc <- lisa_mc[, "Pr(z != E(Ii))"]  
+
+# Create a cluster type column for High-High, Low-Low, High-Low, and Low-High clusters
+panel_data_scaled$cluster_type <- with(panel_data_scaled, ifelse(
+  p_value_mc < 0.05 & local_moran > 0, "High-High", 
+  ifelse(p_value_mc < 0.05 & local_moran < 0, "Low-Low", 
+         ifelse(p_value_mc < 0.05 & local_moran > 0 & lag(local_moran) < 0, "High-Low", 
+                ifelse(p_value_mc < 0.05 & local_moran < 0 & lag(local_moran) > 0, "Low-High", 
+                       "Not Significant")
+         )
+  )
+))
+
+ggplot(panel_data_scaled) +
+  geom_sf(aes(fill = cluster_type)) +
+  scale_fill_manual(
+    values = c(
+      "High-High" = "red",        # areas of high values with neighbors of high values,
+      "Low-Low" = "blue",         # areas of high values with neighbors of low values
+      "High-Low" = "orange",      # areas of low values with neighbors of high values,
+      "Low-High" = "green",       # areas of low values with neighbors of low values.
+      "Not Significant" = "gray"
+    ),
+    name = "Cluster Type"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Cluster Types: High-High, Low-Low, High-Low, Low-High",
+    subtitle = "Based on Local Moran's I and Monte Carlo p-values < 0.05",
+    fill = "Cluster Type"
+  )
+
+
+### Map of Resduial ###
+
+panel_data_scaled$residuals <- residuals
+
+grps <- 5 # Number of groups
+brks <- quantile(panel_data_scaled$residuals, probs = seq(0, 1, length.out = grps + 1), na.rm = TRUE)
+colors <- colorRampPalette(c("blue", "orange", "red"))(length(brks) - 1)
+
+ggplot(panel_data_scaled) +
+  geom_sf(aes(fill = cut(residuals, breaks = brks)), color = "black") + # Black borders
+  scale_fill_manual(values = colors, name = "Residuals") +
+  theme_minimal() +
+  labs(title = "Map of Model Residuals", fill = "Residuals")
+
+### QQ PLot ###
+
+# Extract residuals and fitted values from the spatial model M1
+residuals_M1 <- M1$residuals
+fitted_values_M1 <- M1$fitted.values
+
+# P1: Residual vs Fitted Values
+P1 <- ggplot(data = data.frame(residuals = residuals_M1, fitted = fitted_values_M1), aes(y = residuals, x = fitted)) +
+  geom_point() +
+  ggtitle("Residual Plot") +
+  xlab("Predicted Values") +
+  ylab("Residuals")
+
+# P2: Histogram of Residuals
+P2 <- ggplot(data = data.frame(residuals = residuals_M1), aes(x = residuals)) +
+  geom_histogram() +
+  ggtitle("Histogram of Residuals") +
+  xlab("Residuals")
+
+# P3: QQ Plot for Residuals
+P3 <- ggplot(data = data.frame(residuals = residuals_M1), aes(sample = scale(residuals))) +
+  stat_qq() +
+  stat_qq_line() +
+  xlab("Normal Quantiles") +
+  ylab("Residual Quantiles") +
+  ggtitle("QQ Plot")
+
+# Combine all three plots into one grid
+grid.arrange(P1, P2, P3, ncol = 3)
+```
+
+```{}
+# different model, exact same result
+sarsrmod <- spreml(homePrems ~ log(home_damage) + log(disaster_damage), 
+                   data = panel_data_scaled, 
+                   w = lw, 
+                   index = c("State", "Year"), 
+                   errors="re", 
+                   lag=FALSE, 
+                   method="BFGS")
+
+summary(sarsrmod)
+```
+
+#### Rand ####
+
+This sections comes from Professor Lhost ideas, it was to find out what a truly random map would look. I added vars from model_ready to see if this method could show spatial correlation although I believe the Moran's I test would do the same. 
+```{r}
+# Define the coefficients
+b0 <- 10    # Intercept
+b1 <- 4    # Coefficient for x
+
+# Create random data for x and x1
+n <- nrow(model_ready)  # Number of rows in model_ready
+x <- runif(n, min = 0, max = 50)  # Random values for x (uniform distribution)
+x1 <- runif(n, min = 0, max = 50)  # Random values for x1
+
+# variables spatial autocorrelation
+homePrems <- model_ready$homePrems # basically strongly correlated, .25ish
+Coastal <- model_ready$Coastal # not correlated 
+home_damage <- model_ready$home_damage # correlated .15ish
+td_per_cap <- model_ready$td_per_cap # correlated .07ish
+disaster_damage <- model_ready$disaster_damage # super correlated, .4ish
+PriceDef <-  model_ready$PriceDef # correlated .05ish
+PopDensity <- model_ready$PopDensity # super correlated .45ish
+Pop18_64 <- model_ready$Pop18_64 # not correlated 
+Uninsured <- model_ready$Uninsured # not correlated
+Medicaid <- model_ready$Medicaid # not correlated
+MedHomeIncome <- model_ready$MedHomeIncome # correlated .25ish
+
+# Generate y based on the linear equation
+u <- rnorm(n, mean = 0, sd = 1)  # Random noise
+y <- b0 + b1 * x + PopDensity + u
+
+# Combine into a new dataset
+random_data <- model_ready
+random_data$x <- x
+random_data$x1 <- x1
+random_data$y <- y
+
+grps <- 5 # Number of groups
+brks <- quantile(random_data$y, probs = seq(0, 1, length.out = grps + 1), na.rm = TRUE)
+colors <- colorRampPalette(c("blue", "orange", "red"))(length(brks) - 1)
+
+ggplot(random_data) +
+  geom_sf(aes(fill = cut(y, breaks = brks)), color = "black") + # Black borders
+  scale_fill_manual(values = colors, name = "Residuals") +
+  theme_minimal() +
+  labs(title = "Map of Model Residuals", fill = "Residuals")
+
+```
+
+```{r}
+# Moran's I test on residuals
+moran.test(y, weights_across_years, alternative = "greater")
+
+MC <- moran.mc(y, weights_across_years, nsim = 999, alternative = "greater") # prefered method 
+
+plot(MC)
+```
+
