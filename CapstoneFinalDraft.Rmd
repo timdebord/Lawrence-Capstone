@@ -1,0 +1,1414 @@
+---
+title: "The Impact of Storm Damage on Homeowners Insurance Premiums Across the United States"
+output: 
+  pdf_document:
+    extra_dependencies: ["amsmath", "amssymb"]
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{amssymb}
+  - \usepackage{titling}
+fontsize: 12pt
+geometry: margin=1in
+---
+
+\begin{center}
+
+\textbf{Timothy DeBord} \\
+Lawrence University \\
+
+\vspace{0.5cm}
+
+Faculty Advisor: Professor Andrew J. Sage \\
+Faculty Advisor: Professor Jonathan Lhost \\
+Faculty Advisor: Professor Abhishek Chakraborty \\
+
+\vspace{1cm}
+
+{\small \today}
+
+\end{center}
+
+
+```{r, include = FALSE}
+## Keep when turning in
+knitr::opts_chunk$set(include=FALSE, echo=FALSE, message=FALSE, warning=FALSE)
+```
+
+# Abstract 
+
+As the United States experiences an increasing number of disasters each year, the effects of climate change are becoming more evident. This paper examines the relationship between storm damage and homeowners insurance premiums. Using damage covered by homeowners insurance as the treatment variable, I applied a spatial error model that uses two-way state and year fixed effects to analyze its impact on premiums. The results indicate a small positive effect of covered storm damage on homeowners insurance premiums. 
+
+\newpage
+
+
+```{r}
+library(ggplot2)
+library(tidyverse)
+library(dplyr)
+library(stargazer)
+library(knitr)
+library(kableExtra)
+library(plm)
+library(lme4)
+library(sf)
+library(leaflet)
+library(spdep)
+library(spatialreg)
+library(sp)
+library(terra)
+library(tmap)
+library(splm)
+library(plm)
+library(corrplot)
+library(gridExtra)
+library(car)
+library(lmtest)
+library(tinytex)
+library(png)
+library(grid)
+```
+
+```{r}
+df <- read.csv("C:/Users/timmy/Desktop/School Files/Capstone/Final CSVs/Final Spatial Data Natural Hazards.csv")
+states_sf <- st_read("C:/Users/timmy/Desktop/School Files/Capstone/tl_2024_us_state.shp", promote_to_multi = FALSE)
+
+df$State <- as.factor(df$State)
+```
+
+```{r}
+#states_sf <- st_cast(states_sf, "POLYGON")
+
+states_sf <- states_sf %>%
+  rename(State = NAME)
+
+# Temporarily save geometry and attributes separately
+geometry <- st_geometry(states_sf)
+attributes <- st_drop_geometry(states_sf)
+
+# Expand attributes to include all years
+expanded_attributes <- attributes %>%
+  mutate(dummy = 1) %>%  
+  expand_grid(Year = 2008:2019) %>%  
+  select(-dummy)  
+
+# Combine expanded attributes with original geometry
+states_sf <- st_sf(expanded_attributes, geometry = rep(geometry, each = length(2008:2019)))
+```
+
+```{r}
+df_test <- df 
+#df_test$Percent_white <- df_test$Percent_white * 100
+
+#df_test$DAMAGE_PROPERTY <- df_test$DAMAGE_PROPERTY / 1000
+#df_test$DAMAGE_CROPS <- df_test$DAMAGE_CROPS / 1000
+```
+
+```{r}
+final_df <- states_sf %>%
+  inner_join(df_test, by = c("State", "Year"))
+```
+
+```{r}
+final_df <- final_df %>%
+  filter(!State %in% c("Hawaii", "Alaska"))
+
+final_df <- final_df %>%
+  select(-total_damage_property.y, -total_damage_crops.y) %>%  
+  rename(
+    total_damage_property = total_damage_property.x,  
+    total_damage_crops = total_damage_crops.x  
+  )
+
+#model_ready <- final_df %>%
+  #arrange(Year, State)  %>% 
+  #mutate(total_damage = total_damage_property + total_damage_crops) %>% 
+  #mutate(td_per_cap = total_damage / Total_Residents)
+
+model_ready <- final_df %>%
+  arrange(Year, State)  %>% 
+  mutate(total_damage = total_damage_property) %>% 
+  mutate(td_per_cap = total_damage / Total_Residents)
+
+model_ready <- model_ready %>%
+  rename(
+    homePrems = Home.Avg.Premium,
+    rentersPrems = Renters.Avg.Premium,
+    HealthcareExp = Health.Spending.per.Capita,
+    Pop18_64 = Total_Pop_Dis,
+    Uninsured = Percent.Adults.19.64.Uninsured,
+    Medicaid = Percent,
+    PriceDef = RegionalPriDef,
+    Coastal = Is_Coastal,
+    MedHomeIncome = Median.Income,
+    AvgHomePrice = Avg_Home_Price,
+    RiskIndex = National_Risk_Index_Score_Composite,
+    ExpAnnualLoss = Expected.Annual.Loss...Score...Composite
+  )
+```
+
+
+```{r}
+geometry <- st_geometry(model_ready)  
+model_ready_no_geom <- model_ready %>%
+  st_drop_geometry()
+
+sev_weather_property_cols <- names(model_ready_no_geom) %>%
+  str_subset("damage_property_(tornado|excessive_heat|heavy_snow|high_wind|hail|winter_storm|blizzard|ice_storm|strong_wind|lightning)")
+
+sev_weather_crops_cols <- names(model_ready_no_geom) %>%
+  str_subset("damage_crops_(tornado|excessive_heat|heavy_snow|high_wind|hail|winter_storm|blizzard|ice_storm|strong_wind|lightning)")
+
+disaster_property_cols <- names(model_ready_no_geom) %>%
+  str_subset("damage_property_(hurricane|flood|flash_flood|storm_surge_tide|wildfire|coastal_flood|lakeshore_flood|tsunami)")
+
+disaster_crops_cols <- names(model_ready_no_geom) %>%
+  str_subset("damage_crops_(hurricane|flood|flash_flood|storm_surge_tide|wildfire|coastal_flood|lakeshore_flood|tsunami)")
+
+model_ready_no_geom <- model_ready_no_geom %>%
+  mutate(
+    num_sev_weather_property = rowSums(select(., all_of(sev_weather_property_cols)), na.rm = TRUE),
+    num_sev_weather_crops = rowSums(select(., all_of(sev_weather_crops_cols)), na.rm = TRUE),
+    disasters_property = rowSums(select(., all_of(disaster_property_cols)), na.rm = TRUE),
+    disasters_crops = rowSums(select(., all_of(disaster_crops_cols)), na.rm = TRUE)
+  ) %>%
+  mutate(
+    home_damage = num_sev_weather_property + num_sev_weather_crops,
+    disaster_damage = disasters_property + disasters_crops,
+    combined_damage = home_damage + disaster_damage + 2000,
+    climate_index = combined_damage / RiskIndex,
+    building_risk = (ExpAnnualLoss / Total_Value) * PriceDef,
+    realized_damaged = (combined_damage / ExpAnnualLoss) * RiskIndex,
+    actual_NRI = (combined_damage) * (Social/ Community)
+  )
+
+model_ready <- st_sf(model_ready_no_geom, geometry = geometry)
+```
+
+```{r}
+states <- c("Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado", "Connecticut", 
+            "Delaware", "Florida", "Georgia", "Hawaii", "Idaho", "Illinois", "Indiana", 
+            "Iowa", "Kansas", "Kentucky", "Louisiana", "Maine", "Maryland", 
+            "Massachusetts", "Michigan", "Minnesota", "Mississippi", "Missouri", "Montana", 
+            "Nebraska", "Nevada", "New Hampshire", "New Jersey", "New Mexico", "New York", 
+            "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon", "Pennsylvania", 
+            "Rhode Island", "South Carolina", "South Dakota", "Tennessee", "Texas", 
+            "Utah", "Vermont", "Virginia", "Washington", "West Virginia", "Wisconsin", 
+            "Wyoming")
+
+square_miles <- c(52420, 665384, 113990, 53179, 163695, 104094, 5543, 2489, 65758, 59425, 10932, 83569, 
+                  57914, 36420, 56273, 82278, 40408, 52378, 35380, 12406, 10554, 96714, 86936, 48432, 
+                  69707, 147040, 77348, 110572, 9349, 8723, 121590, 54555, 53819, 70698, 44826, 
+                  69899, 98379, 46054, 1545, 32020, 77116, 42144, 268596, 84897, 9616, 42775, 71298, 
+                  24230, 65496, 97813) # Census Bureau 
+
+years <- rep(2008:2019, each = length(states))
+
+state_area <- data.frame(State = rep(states, times = length(2008:2019)),
+                       Square_Miles = rep(square_miles, times = length(2008:2019)),
+                       Year = years)
+
+state_area <- state_area[!state_area$State %in% c("Alaska", "Hawaii"), ]
+
+model_ready <- model_ready %>% 
+  left_join(state_area, by = c("State", "Year"))
+
+model_ready$PopDensity <- model_ready$Total_Residents / model_ready$Square_Miles
+
+model_ready <- model_ready %>%
+  mutate(Region = case_when(
+    State %in% c("Connecticut", "Delaware", "Maine", "Maryland", "Massachusetts", "New Hampshire", 
+                 "New Jersey", "New York", "Pennsylvania", "Rhode Island", "Vermont") ~ "Northeast",
+    State %in% c("Iowa", "Michigan", "Minnesota", "Wisconsin") ~ "Upper Midwest",
+    State %in% c("Illinois", "Indiana", "Kentucky", "Missouri", "Ohio", "Tennessee", "West Virginia") ~ "Ohio Valley",
+    State %in% c("Alabama", "Florida", "Georgia", "North Carolina", "South Carolina", "Virginia") ~ "Southeast",
+    State %in% c("Montana", "Nebraska", "North Dakota", "South Dakota", "Wyoming") ~ "Northern Rockies and Plains",
+    State %in% c("Arkansas", "Kansas", "Louisiana", "Mississippi", "Oklahoma", "Texas") ~ "South",
+    State %in% c("Arizona", "Colorado", "New Mexico", "Utah") ~ "Southwest",
+    State %in% c("Idaho", "Oregon", "Washington") ~ "Northwest",
+    State %in% c("California", "Nevada") ~ "West",
+    TRUE ~ "Unknown"  # Default case for unmatched states
+  ))
+
+model_ready <- model_ready %>%
+  arrange(Year, State)
+
+### STATE-YEAR FIXED EFFECTS ###
+model_ready <- model_ready %>% 
+  mutate(RegionYearFE = paste(Region,Year, sep= "-"))
+```
+
+# Introduction 
+
+Climate change is a looming threat that all of humanity faces together. In recent years, wildfires, hurricanes, and other deadly natural disasters have become more frequent. In 2024 alone, California was ablaze, while the Atlantic Ocean unleashed an unprecedented number of hurricanes on the United States East Coast. Scientific theory suggests that as global ocean surface temperatures rise, the number of tropical storms and hurricanes will also increase due to the Coriolis effect, which causes storms to rotate and influences their movement based on the Earth's rotation and wind patterns. These events leave destruction in their wake, often resulting in costly damages. As the risks of climate change grow, so should the cost of insurance that covers storm-related damage. Specifically, homeowners insurance premiums reflect an insurer’s perceived risk of insuring a client and the surrounding area. The higher the risk, the more premiums should rise. In my analysis I will look at storm data from the National Oceanic and Atmospheric Administration (NOAA) to examine their effect on homeowners insurance premiums between 2008 and 2019 by using a spatial error panel model by maximum likelihood in R.  
+
+Intuitively, I expect to find a positive significant relationship between damage covered by homeowners insurance and homeowners premiums. The more damage a state receives, the higher the amount insurance companies will have to pay in claims, and therefore, premiums should be higher to account for the risk of damage. Furthermore, the effect of damage not covered by homeowners insurance is less clear. If the damage is covered by a different type of insurance, I expect to see a negative effect on homeowners premiums due to the economic substitution effect. It is also reasonable to believe that there will be no effect, as the damage should hypothetically not impact homeowners premiums if it is excluded from how insurance companies calculate premiums.  
+
+The existing literature supports the idea that homeowners insurance premiums are related to climate risk. In 2024, Benjamin J. Keys and Philip Mulder analyzed the relationship between property insurance and disaster risk and found that premiums have risen sharply since 2020, with this growth concentrated in disaster-prone ZIP codes (Keys et al., 2020). Keys and Mulder split their natural disaster risk variable into disaster risk and climate risk, and I used that idea as a basis for separating damage into coverable and non-coverable damage depending on the storm. Additionally, when accounting for socioeconomic status and demographic variables, they used the percentage of the population that is not white as an explanatory variable. Their reasoning was that lower-income areas see much higher premiums as a share of income, and ZIP codes with larger nonwhite population shares pay higher premiums even after controlling for disaster risk and income (Keys et al., 2020).  
+
+Further, in 2012, Randy E. Dumm et al. tested the hypothesis of whether increases in insurance premiums serve as a risk signal and negatively impact house prices. Dumm et al. found a negative and significant relationship between insurance premiums and house prices in each regression (Dumm et al., 2012). Dumm et al.’s use of home prices helped me decide between the importance of average home prices and median household income, and I ultimately chose the former. Additionally, their findings provided intuition behind the relationship between home prices and premium prices. In high-risk areas, they found that places with historically high damage had reductions in home prices but still had to pay higher premiums.  
+
+# Data
+
+The data in this paper merges information from three different sources: the National Oceanic and Atmospheric Administration (NOAA), Kaiser Family Foundation (KFF), and Zillow. After dropping Alaska and Hawaii, the final spatial panel dataset includes 48 states from 2008 to 2019, totaling 576 observations across 224 variables. It also contains spatial polygons for each state, allowing me to analyze the spatial relationships between homeowners insurance premiums and storm damage. Table 1 presents the first five rows of the dataset, highlighting the key variables used in my analysis: homeowners insurance premiums, total home damage, total natural disaster damage, average home price, percentage of the population that is white, and population density.   
+
+```{r, include=TRUE, tab.cap = "Selected variables from the first 5 rows in the dataset"}
+# Function to round numeric columns to 2 decimal places
+round_df <- function(df, digits) {
+  df %>% mutate(across(where(is.numeric), ~ round(., digits)))
+}
+
+# Assume your data frame is named 'model_ready'
+# Extract the variables of interest
+vars_of_interest <- model_ready[, c("State" , "Year", "homePrems", "home_damage", "disaster_damage", "AvgHomePrice", "Percent_white", "PopDensity")]
+
+vars_of_interest <- vars_of_interest %>%
+  rename(
+    "Home Premiums" = homePrems,
+    "Home Damage" = home_damage,
+    "Disaster Damage" = disaster_damage,
+    "Percent White" = Percent_white,
+    "Avg Home Price" = AvgHomePrice
+  )
+
+# Round the numeric columns to 2 decimal places
+vars_of_interest <- round_df(vars_of_interest, 2)
+
+# Show the first 5 rows
+table <- head(vars_of_interest, 5)
+
+kable(table, format = "latex", booktabs = TRUE, longtable = FALSE, align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down")) %>%
+  column_spec(1, width = "2cm")
+```
+
+Looking at Table 1, the geometry variable provides the dataset with its spatial attributes. The NOAA dataset includes every storm recorded in the United States between 1950 and 2024. After filtering to keep only storms that occurred between 2008 and 2019, each row either contained a latitude and longitude coordinate for a storm or had a missing value. To address this, I used a shapefile from the Census Bureau that provided polygon data for each state and merged each storm with the state in which it was recorded. This effectively transformed the spatial data from point data to polygon data, aligning it with the rest of my dataset, which is at the state level. For storms that affected multiple states, each state recorded the event and reflected the corresponding storm data.  
+
+After restructuring the dataset, I created the damage variables. Home damage represents damage caused by storms that are typically covered by homeowners insurance, including tornadoes, excessive heat, heavy snow, high winds, hail, winter storms, blizzards, ice storms, strong winds, and lightning. Disaster damage includes damage from events that generally aren’t covered by homeowners insurance and often require specialized coverage, such as hurricanes, floods, flash floods, storm surges, wildfires, coastal floods, lakeshore floods, and tsunamis. I separated these damage types because damage typically covered by homeowners insurance should explain some variation in insurance premiums, while damage outside standard coverage may have a less direct impact on pricing. Looking at the left map in Figure 1, we can see that areas like Tornado Alley experience more damage than regions that don’t frequently get tornadoes. Historically, Tornado Alley refers to the central United States, specifically the region stretching from Texas through Oklahoma, Kansas, and into the Dakotas. However, the overall distribution of home damage is fairly spread out, with no extreme outliers. When looking at disaster damage, a different pattern emerges. Florida, Louisiana, and especially Texas have sustained significantly more damage than the rest of the country. This is largely due to the devastating hurricanes that hit these regions between 2008 and 2019. 
+
+```{r, include=TRUE, fig.cap= "Left map shows home damage, right shows disaster damage (mln = million)"}
+# Aggregate the total damage by state while keeping geometry
+state_damage_2 <- model_ready %>%
+  group_by(State) %>%
+  summarise(home_damage = sum(home_damage, na.rm = TRUE), 
+            disaster_damage = sum(disaster_damage, na.rm = TRUE),
+            actual_NRI = sum(actual_NRI, na.rm = TRUE),
+            geometry = st_union(geometry)) %>%
+  ungroup()
+
+# Convert leaflet map to a static tmap
+tm_shape(state_damage_2) +
+  tm_polygons("home_damage", 
+              title = "Total Home Damage",
+              palette = "YlOrRd",
+              style = "quantile",
+              n = 8) +
+  tm_layout(main.title = "Home Damage by State") -> homedamageplot
+
+tm_shape(state_damage_2) +
+  tm_polygons("disaster_damage", 
+              title = "Total Disaster Damage",
+              palette = "YlOrRd",
+              style = "quantile",
+              n = 8) +
+  tm_layout(main.title = "Disaster Damage by State") -> disasterdamageplot
+
+tmap_arrange(homedamageplot, disasterdamageplot, ncol = 2)
+
+```
+
+Storms in the United States have historically been classified into nine climate regions: Northeast, Upper Midwest, Ohio Valley, Southeast, Northern Rockies and Plains, South, Southwest, Northwest, and West. Although premiums are not determined at the regional level, states within the same region experience similar risks and hypothetically should have comparable premium prices. I will use regions as a potential fixed effect rather than state fixed effects, which will be further detailed in the methods section. Below, in Figure 2, the left map from NOAA displays the defined climate regions, while the right map shows the average homeowners insurance premiums from 2008 to 2019. Comparing the two maps reveals that the South region, on average, has the highest premiums, suggesting that the idea of regions sharing similar premiums due to regional risk is not unreasonable. 
+
+```{r, include=TRUE, fig.cap = "Top map shows regions while bottom map shows homeowners premiums"}
+# Aggregate the total damage by state while keeping geometry
+state_damage <- model_ready %>%
+  group_by(State) %>%
+  summarise(homePrems = mean(homePrems, na.rm = TRUE),
+            geometry = st_union(geometry)) %>%
+  ungroup()
+
+# Create a static map using tmap
+homePrems_map <- tm_shape(state_damage) +
+  tm_polygons("homePrems",
+              title = "Homeowner Premiums",
+              palette = "YlOrRd",
+              style = "quantile",
+              n=8) +
+  tm_layout(main.title = "Average Homeowner Premiums by State")
+
+# Save the map as a PNG file
+tmap_save(homePrems_map, "homePrems_map.png")
+
+# Read the saved map image
+homePrems_map_img <- readPNG("homePrems_map.png")
+
+# Read the image from the local file
+image_path <- "C:/Users/timmy/Desktop/School Files/Capstone/Screenshot 2025-02-27 115258.png"  # Correct file path
+img <- readPNG(image_path)
+
+# Create the plot grid: map on the left, image on the right
+grid.arrange(rasterGrob(img),rasterGrob(homePrems_map_img), ncol = 1)
+```
+
+In addition, the other control variables include the percentage of the population that is white, population density, and average home price. The percentage of the population that is white comes from KFF, formerly known as the Kaiser Family Foundation. This variable helps control for potential racial disparities in insurance pricing, whether due to discrimination or coincidental factors, both of which could influence homeowners insurance premiums. Population density is calculated by dividing the total number of residents in each state by the state’s area in square miles, using data from KFF and the Census Bureau. Accounting for each state's population density should impact home insurance because, in densely populated areas, insurance companies have a larger pool of policyholders, which helps distribute risk. Conversely, in less densely populated areas, the risk pool is smaller, meaning premiums may be higher to compensate for the increased financial exposure per policyholder. Finally, the last control variable is average home price, which I got from Zillow. The average home price should directly impact homeowners insurance premiums since the higher the property value, the more there is for an insurance company to cover under a single policy, leading to higher premiums.  
+
+# Methodology 
+
+The main goal of this paper is to examine the spatial relationship between homeowners insurance premiums and storm damage. To do that, we first need to test whether an Ordinary Least Squares (OLS) regression shows evidence of spatial autocorrelation. From there, we have to define the neighbors and weights of the model, which will allow us to incorporate a spatial element into the calculations. Once that’s set up, we can build the final model using the spml function from the splm package in R (Millo et al. 2012).  
+
+Before deciding whether to build a spatial model, I first need to run an OLS regression, as shown in Table 2. The regression output shows that the treatment variable — damage that would be covered by homeowners insurance — is not statistically significant, meaning that their p-values are greater than 0.1. Likewise, damage that wouldn’t be covered by homeowners insurance is also not statistically significant. However, the average home price, the percentage of a state's population that is white, and population density are all statistically significant. That said, these results only matter if there’s no evidence of spatial autocorrelation. 
+```{r}
+nb <- model_ready %>%
+  filter(Year %in% c(2011))
+
+centroids <- st_centroid(nb)  # This should already be in 'sf' format
+
+centroids_sp <- as(centroids, "Spatial")
+
+dist_matrix <- spDists(centroids_sp)
+
+# Create neighbors list
+neighbors <- dnearneigh(centroids_sp, 0, 525)
+
+# Define row indices for California, Arizona, and Oregon
+california_index <- 4L  # Ensure it's an integer
+arizona_index <- 2L
+oregon_index <- 35L
+
+neighbors[[california_index]] <- sort(unique(as.integer(c(neighbors[[california_index]], arizona_index, oregon_index))))
+neighbors[[arizona_index]] <- sort(unique(as.integer(c(neighbors[[arizona_index]], california_index))))
+neighbors[[oregon_index]] <- sort(unique(as.integer(c(neighbors[[oregon_index]], california_index))))
+
+# Define row indices for Florida and its neighboring states
+florida_index <- 8L  # Replace X with Florida's row index
+mississippi_index <- 22L  # Replace Y with Mississippi's row index
+alabama_index <- 1L   # Replace Z with Alabama's row index
+south_carolina_index <- 38L  # Replace A with South Carolina's row index
+louisiana_index <- 16L  # Replace B with Louisiana's row index
+
+# Update the neighbors list
+neighbors[[florida_index]] <- sort(unique(as.integer(c(neighbors[[florida_index]], mississippi_index, alabama_index, south_carolina_index))))
+neighbors[[mississippi_index]] <- sort(unique(as.integer(c(neighbors[[mississippi_index]], florida_index))))
+neighbors[[alabama_index]] <- sort(unique(as.integer(c(neighbors[[alabama_index]], florida_index))))
+neighbors[[south_carolina_index]] <- sort(unique(as.integer(c(neighbors[[south_carolina_index]], florida_index))))
+
+
+# Define row indices for Texas and its neighboring states
+texas_index <- 41L  # Replace X with Texas's row index
+new_mexico_index <- 29L  # Replace Y with New Mexico's row index
+arkansas_index <- 3L  # Replace A with Arkansas's row index
+
+# Update the neighbors list
+neighbors[[texas_index]] <- sort(unique(as.integer(c(neighbors[[texas_index]], new_mexico_index, louisiana_index, arkansas_index))))
+neighbors[[new_mexico_index]] <- sort(unique(as.integer(c(neighbors[[new_mexico_index]], texas_index))))
+neighbors[[louisiana_index]] <- sort(unique(as.integer(c(neighbors[[louisiana_index]], texas_index))))
+neighbors[[arkansas_index]] <- sort(unique(as.integer(c(neighbors[[arkansas_index]], texas_index))))
+
+# Define row indices for Colorado, Kansas, and Nebraska
+colorado_index <- 5L  # Replace X with Colorado's row index
+kansas_index <- 14L  # Replace Y with Kansas's row index
+nebraska_index <- 25L  # Replace Z with Nebraska's row index
+
+# Update the neighbors list
+neighbors[[colorado_index]] <- sort(unique(as.integer(c(neighbors[[colorado_index]], kansas_index, nebraska_index))))
+neighbors[[kansas_index]] <- sort(unique(as.integer(c(neighbors[[kansas_index]], colorado_index))))
+neighbors[[nebraska_index]] <- sort(unique(as.integer(c(neighbors[[nebraska_index]], colorado_index))))
+
+# Define row indices for Idaho, Utah, and Wyoming
+idaho_index <- 10L  # Replace X with Idaho's row index
+utah_index <- 42L  # Replace Y with Utah's row index
+wyoming_index <- 48L  # Replace Z with Wyoming's row index
+
+# Update the neighbors list
+neighbors[[idaho_index]] <- sort(unique(as.integer(c(neighbors[[idaho_index]], utah_index, wyoming_index))))
+neighbors[[utah_index]] <- sort(unique(as.integer(c(neighbors[[utah_index]], idaho_index, wyoming_index))))
+neighbors[[wyoming_index]] <- sort(unique(as.integer(c(neighbors[[wyoming_index]], idaho_index, utah_index))))
+
+
+# Update the neighbors list
+neighbors[[nebraska_index]] <- sort(unique(as.integer(c(neighbors[[nebraska_index]], kansas_index, wyoming_index))))
+neighbors[[kansas_index]] <- sort(unique(as.integer(c(neighbors[[kansas_index]], nebraska_index))))
+neighbors[[wyoming_index]] <- sort(unique(as.integer(c(neighbors[[wyoming_index]], nebraska_index))))
+
+
+# Define row indices for Washington and Idaho
+washington_index <- 45L  # Replace X with Washington's row index
+
+# Update the neighbors list
+neighbors[[washington_index]] <- sort(unique(as.integer(c(neighbors[[washington_index]], idaho_index))))
+neighbors[[idaho_index]] <- sort(unique(as.integer(c(neighbors[[idaho_index]], washington_index))))
+
+# Define row indices for Nevada and Idaho
+nevada_index <- 26L  # Replace X with Nevada's row index
+
+# Update the neighbors list
+neighbors[[nevada_index]] <- sort(unique(as.integer(c(neighbors[[nevada_index]], idaho_index))))
+neighbors[[idaho_index]] <- sort(unique(as.integer(c(neighbors[[idaho_index]], nevada_index))))
+
+# Update the neighbors list
+neighbors[[new_mexico_index]] <- sort(unique(as.integer(c(neighbors[[new_mexico_index]], arizona_index))))
+neighbors[[arizona_index]] <- sort(unique(as.integer(c(neighbors[[arizona_index]], new_mexico_index))))
+
+# Define row indices for Montana, South Dakota, and North Dakota
+montana_index <- 24L  # Replace X with Montana's row index
+south_dakota_index <- 39L  # Replace Y with South Dakota's row index
+north_dakota_index <- 32L # Replace Z with North Dakota's row index
+
+# Update the neighbors list
+neighbors[[montana_index]] <- sort(unique(as.integer(c(neighbors[[montana_index]], south_dakota_index, north_dakota_index))))
+neighbors[[south_dakota_index]] <- sort(unique(as.integer(c(neighbors[[south_dakota_index]], montana_index, north_dakota_index))))
+neighbors[[north_dakota_index]] <- sort(unique(as.integer(c(neighbors[[north_dakota_index]], montana_index, south_dakota_index))))
+
+# Update the neighbors list
+neighbors[[wyoming_index]] <- sort(unique(as.integer(c(neighbors[[wyoming_index]], south_dakota_index))))
+neighbors[[south_dakota_index]] <- sort(unique(as.integer(c(neighbors[[south_dakota_index]], wyoming_index))))
+
+# Define row indices for Kentucky and Virginia
+kentucky_index <- 15L  # Replace X with Kentucky's row index
+virginia_index <- 44L  # Replace Y with Virginia's row index
+
+# Update the neighbors list
+neighbors[[kentucky_index]] <- sort(unique(as.integer(c(neighbors[[kentucky_index]], virginia_index))))
+neighbors[[virginia_index]] <- sort(unique(as.integer(c(neighbors[[virginia_index]], kentucky_index))))
+
+# Define row indices for Tennessee and North Carolina
+tennessee_index <- 40  # Replace Z with Tennessee's row index
+north_carolina_index <- 31L  # Replace A with North Carolina's row index
+
+# Update the neighbors list
+neighbors[[tennessee_index]] <- sort(unique(as.integer(c(neighbors[[tennessee_index]], north_carolina_index))))
+neighbors[[north_carolina_index]] <- sort(unique(as.integer(c(neighbors[[north_carolina_index]], tennessee_index))))
+
+# Update the neighbors list
+neighbors[[utah_index]] <- sort(unique(as.integer(c(neighbors[[utah_index]], arizona_index))))
+neighbors[[arizona_index]] <- sort(unique(as.integer(c(neighbors[[arizona_index]], utah_index))))
+
+# Update the neighbors list
+neighbors[[arkansas_index]] <- sort(unique(as.integer(c(neighbors[[arkansas_index]], tennessee_index))))
+neighbors[[tennessee_index]] <- sort(unique(as.integer(c(neighbors[[tennessee_index]], arkansas_index))))
+
+# Define row indices for Missouri and Kentucky
+missouri_index <- 23L  # Replace Z with Missouri's row index
+
+# Update the neighbors list
+neighbors[[missouri_index]] <- sort(unique(as.integer(c(neighbors[[missouri_index]], kentucky_index))))
+neighbors[[kentucky_index]] <- sort(unique(as.integer(c(neighbors[[kentucky_index]], missouri_index))))
+
+# Define row indices for Michigan and Indiana
+michigan_index <- 20L  # Replace X with Michigan's row index
+indiana_index <- 12L  # Replace Y with Indiana's row index
+
+# Update the neighbors list
+neighbors[[michigan_index]] <- sort(unique(as.integer(c(neighbors[[michigan_index]], indiana_index))))
+neighbors[[indiana_index]] <- sort(unique(as.integer(c(neighbors[[indiana_index]], michigan_index))))
+
+# Define row indices for Michigan and Illinois
+illinois_index <- 11L  # Replace Y with Illinois's row index
+
+# Update the neighbors list
+neighbors[[michigan_index]] <- sort(unique(as.integer(c(neighbors[[michigan_index]], illinois_index))))
+neighbors[[illinois_index]] <- sort(unique(as.integer(c(neighbors[[illinois_index]], michigan_index))))
+
+iowa_index <- 13L  # Replace Y with Iowa's row index
+
+# Update the neighbors list
+neighbors[[south_dakota_index]] <- sort(unique(as.integer(c(neighbors[[south_dakota_index]], iowa_index))))
+neighbors[[iowa_index]] <- sort(unique(as.integer(c(neighbors[[iowa_index]], south_dakota_index))))
+
+# Define row indices for Nevada, Arizona, and Oregon
+oregon_index <- 35L  # Replace Z with Oregon's row index
+
+# Update the neighbors list
+neighbors[[arizona_index]] <- sort(unique(as.integer(c(neighbors[[arizona_index]], nevada_index))))  # Arizona only neighbors with Nevada
+neighbors[[nevada_index]] <- sort(unique(as.integer(c(neighbors[[nevada_index]], arizona_index, oregon_index))))  # Nevada neighbors with Arizona & Oregon
+neighbors[[oregon_index]] <- sort(unique(as.integer(c(neighbors[[oregon_index]], nevada_index))))  # Oregon neighbors with Nevada
+
+# Update the neighbors list for Colorado and Utah
+neighbors[[colorado_index]] <- sort(unique(as.integer(c(neighbors[[colorado_index]], utah_index))))
+neighbors[[utah_index]] <- sort(unique(as.integer(c(neighbors[[utah_index]], colorado_index))))
+
+# Update the neighbors list for Nebraska and Iowa
+neighbors[[nebraska_index]] <- sort(unique(as.integer(c(neighbors[[nebraska_index]], iowa_index))))
+neighbors[[iowa_index]] <- sort(unique(as.integer(c(neighbors[[iowa_index]], nebraska_index))))
+
+lw <- nb2listw(neighbors, style = "B", zero.policy = TRUE)  # Use binary weights first
+
+# Inverse distance weighting
+for (i in 1:length(neighbors)) {
+  neighbor_indices <- neighbors[[i]]
+  total_weight <- 0
+  for (j in 1:length(neighbor_indices)) {
+    distance <- dist_matrix[i, neighbor_indices[j]]
+    if (!is.na(distance) && distance != 0) {
+      weight <- 1 / distance
+      lw$weights[[i]][j] <- weight
+      total_weight <- total_weight + weight
+    } else {
+      lw$weights[[i]][j] <- 0
+    }
+  }
+  # Normalize weights
+  if (total_weight != 0) {
+    lw$weights[[i]] <- lw$weights[[i]] / total_weight
+  }
+}
+
+# Function to replicate weights and neighbors while maintaining class attributes and style (NOT USED FOR SPATIAL PLM)
+replicate_listw <- function(lw, times) {
+  replicated_weights <- rep(lw$weights, times)
+  replicated_neighbours <- do.call("c", replicate(times, lw$neighbours, simplify = FALSE))
+  
+  # Ensure neighbours has correct nb structure and region.id is a character
+  class(replicated_neighbours) <- class(lw$neighbours)
+  
+  # create listw structure, copying the structure of lw
+  expanded_weights <- list(
+    style = lw$style,  # Place style first
+    neighbours = replicated_neighbours,  # Place neighbours second
+    weights = replicated_weights  # Place weights last
+  )
+  class(expanded_weights) <- class(lw)
+  
+  return(expanded_weights)
+}
+
+# Determine the number of years
+num_years <- length(unique(final_df$Year))
+num_rows <- nrow(final_df)
+num_reps <- num_rows / length(lw$weights)
+
+weights_across_years <- replicate_listw(lw, num_reps)
+```
+
+```{r, warning=FALSE, message=FALSE, results= "asis", include=TRUE}
+panel_data <- model_ready 
+
+panel_data <- panel_data %>%
+  mutate(across(where(is.numeric), ~ ifelse(. == 0, . + 1e-07, .)))
+
+M1 <- lm(homePrems ~ log(home_damage) + log(disaster_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity), data = panel_data)
+
+stargazer(M1,
+          type = "latex",
+          report = ('vc*p'),
+          single.row = TRUE,
+          digits = 3,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          out = "table.tex",
+          font.size = "footnotesize",
+          notes.append = FALSE,
+          title = "Regression Models",
+          model.numbers = FALSE,
+          column.labels = c("OLS"))
+```
+
+To test the OLS regression for spatial autocorrelation, I ran a Moran’s I test and a Lagrange multiplier test on the OLS output. Spatial autocorrelation measures the extent to which values of a variable at nearby locations are correlated. If there is evidence of spatial autocorrelation in the OLS model, the independence assumption of OLS is violated, meaning we can’t rely on those results. The null hypothesis of the Moran’s I test states that there is no spatial autocorrelation. Visually, if no spatial autocorrelation is present, the Moran’s I statistic would fall within the distribution shown in Figure 3. However, since the I value was significant, it falls outside the distribution—indicating evidence of spatial autocorrelation. 
+
+```{r,include = TRUE, warning = FALSE, fig.cap="The Moran's I test results", fig.height= 4, fig.width=4}
+# OLS Moran's I
+residuals <- residuals(M1)
+
+MC <- moran.mc(residuals, weights_across_years, nsim = 999, alternative = "greater") # prefered method 
+plot(MC)
+```
+
+The OLS regression has more issues than just failing to account for spatial autocorrelation — it also doesn’t account for the correlation between states and years since I’m using panel data. To address the structure of the data, I’ll use a Panel Data Estimator (plm), also known as a fixed effects model. Applying a fixed effects model to my panel data effectively creates a dummy variable for every state and every year, meaning there are dummies for all 48 states and 11 years in my dataset. This overfits the data, and when I run a Moran’s I test on the fixed effects model, it produces a statistically insignificant I statistic. To properly test for spatial autocorrelation, I instead use a Lagrange Multiplier test. 
+
+A Lagrange Multiplier test checks for spatial autocorrelation in the form of spatial lag and spatial error. Spatial lag occurs when the y-value of one state influences the y-value of a neighboring state—meaning that if spatial lag exists, homeowners insurance premiums in one state affect premiums in neighboring states. Spatial error happens when the error terms of one state are correlated with those of neighboring states. Both cases violate the independence assumption of OLS. Using the Lagrange Multiplier test, I found evidence of both spatial lag and spatial error. (The regression results for the fixed effects model are included in the appendix in section a.1.) Looking at Table 3, both tests are significant based on their p-values. However, despite both being significant, I chose to use a spatial error model since I’m focused on explaining the relationship between homeowners insurance premiums and storm damage rather than how premiums in one state influence those in neighboring states.
+
+```{r, include = TRUE, warning = FALSE}
+### FIXED EFFECTS MODEL ###
+fixed_effects_model <- plm(homePrems ~ log(home_damage) + log(disaster_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity), data = panel_data, index = c("State", "Year"), model = "within", effect = "twoways")
+
+# Extract residuals from the fixed effects model
+residuals_fixed_effects <- residuals(fixed_effects_model)
+
+fixed_test<- homePrems ~ log(home_damage) + log(disaster_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity)
+slm_rlme <- slmtest(fixed_test, panel_data, lw, test = "rlme", index = c("State", "Year"), model = "within")
+slm_rlml <- slmtest(fixed_test, panel_data, lw, test = "rlml", index = c("State", "Year"), model = "within") #"lme","lml","rlme","rlml"
+
+# Display spatial dependence test results in a table format
+spatial_results <- data.frame(
+  Test = c("Error Test", "Lag Test"),
+  Statistic = c(slm_rlme$statistic, slm_rlml$statistic),
+  P_Value = c(slm_rlme$p.value, slm_rlml$p.value)
+)
+
+# Print spatial test results as a presentable table
+kable(spatial_results, caption = "Spatial Dependence Tests for Fixed Effect Model")
+```
+
+As stated in the data section, I transformed the geometry from points representing latitude and longitude to polygons representing states. This allows my model to fully utilize the state-level data I’ve collected while maintaining spatial information. Using these polygons, I can create a neighbors matrix that feeds into an equation to generate the spatial weights required for the model. I chose to combine two different methods to construct the neighbors matrix.  
+
+The first method is distance-based neighboring, where neighbors are determined by measuring the physical distance between points. In this paper, I used the centroid — the center point of a polygon — as the reference point. If a centroid falls within the radius of another centroid, the two states are considered neighbors. However, if any part of a polygon falls within the radius but its centroid does not, they are not considered neighbors. This distinction is illustrated section a.2 of the appendix. In Figure 4, we see the results of using a 525-kilometer radius to define the neighbors matrix. I chose 525 kilometers because any smaller radius would leave Texas without neighbors, which causes an error in R. I tried to keep the radius as small as possible to properly account for the Northeast, where states are densely packed. If I were to have made the radius too big, Maine, for example, would incorrectly be considered a neighbor of West Virginia. While the East Coast appears to be accounted for appropriately, issues arise further west, where many states end up with only one neighbor. To address this, I combined an additional method to refine the neighbors matrix.  
+
+```{r, include = TRUE, warning = FALSE, fig.cap="Map of neighbors with only distance-based neighboring", fig.height= 4, fig.width=6}
+nb1 <- model_ready %>%
+  filter(Year %in% c(2011))
+
+centroids <- st_centroid(nb1)  # This should already be in 'sf' format
+
+centroids_sp <- as(centroids, "Spatial")
+
+dist_matrix <- spDists(centroids_sp)
+# First, create a circle around each centroid
+circle_radius <- 525  # Your specified distance threshold
+buffer <- st_buffer(centroids, dist = circle_radius)
+
+neighbors1 <- dnearneigh(centroids_sp, 0, 525)
+
+# Plot everything in the correct order
+plot(st_geometry(nb1), border = "black")  # Original polygons
+plot(buffer, add = TRUE, col = "transparent", border = "red", lty = 2, density = 50)  # Distance circles
+plot(neighbors1, st_coordinates(st_centroid(st_geometry(nb1))), add = TRUE, 
+     col = "blue", lwd = 1.5)  # Neighbor connections
+```
+
+The second method is rook contiguity, where two states are considered neighbors if they share a side — similar to the movement of a rook in chess. If I had also allowed states that share only a vertex to be neighbors, this would be called queen contiguity. (For a visual reference, see section a.3 in the appendix.) In Figure 5, we see the result of combining both methods, which best represents the United States. This approach ensures that the highly clustered Northeast is properly connected while also maintaining appropriate connections across the rest of the country. 
+
+```{r, include = TRUE, warning = FALSE, fig.cap= "Complete neighbor map using both distance-based neighbors and rook contiguity", fig.height= 4, fig.width=6}
+
+# Plot neighbors connections
+plot(st_geometry(nb), border = "black") # plot polygons with gray borders
+plot(neighbors, st_coordinates(st_centroid(st_geometry(nb))), add = TRUE, col = "blue", lwd = 1.5)
+```
+
+The neighbors matrix alone isn’t enough for the model to account for the spatial nature of the data, so I also needed to specify a weight matrix to incorporate spatial weights. A spatial weight quantifies the relationship between neighbors based on their proximity or connectivity, defining how much influence one unit has on another in a spatial analysis. The most common approach is to assign equal weights by dividing 1 by the total number of neighbors a polygon has. However, this method doesn’t make sense when using distance-based neighbors. For example, New Jersey’s effect on New York shouldn’t be the same as its effect on West Virginia. To better capture this relationship, I use an inverse distance weight matrix, which penalizes states that are farther from the base neighbor while also accounting for the number of neighbors a state has (the equation is provided in section a.4 of the appendix). This ensures that the model receives a weighted matrix that more accurately reflects the spatial relationships across the United States. Looking at Figure 6, we can see Wisconsin and its four neighbors: Michigan, Iowa, Illinois, and Minnesota. Since Michigan’s centroid is the closest to Wisconsin’s, it has the largest weight.  
+
+```{r, include = FALSE}
+library(tigris)
+
+# Get US States boundary data
+us_states <- states(cb = TRUE)
+
+# Define Wisconsin and neighboring states
+neighbor_states <- c("Wisconsin", "Minnesota", "Iowa", "Illinois", "Michigan")
+
+# Extract data for all states that are either Wisconsin or its neighbors
+neighbor_data <- us_states[us_states$NAME %in% neighbor_states, ]
+
+# Calculate centroids for each state
+neighbor_data$centroid <- st_centroid(neighbor_data$geometry)
+
+# Extract x and y coordinates from the centroids
+neighbor_data$x <- st_coordinates(neighbor_data$centroid)[, 1]
+neighbor_data$y <- st_coordinates(neighbor_data$centroid)[, 2]
+```
+
+
+```{r, include = TRUE, warning = FALSE, fig.cap= "Map of the weights of Wisconsin", fig.height= 4, fig.width=4}
+# Example of weights (ensure you have 5 weights: 1 for Wisconsin and others for its neighbors)
+weights <- c(0.251, 0.239,0.311,0.198, 1)  # Adjust for Wisconsin (1.0) and its neighbors
+
+neighbor_data$weight <- weights
+
+# Extract centroid of Wisconsin separately for the lines
+wisconsin_centroid <- neighbor_data[neighbor_data$NAME == "Wisconsin", ]
+wisconsin_x <- wisconsin_centroid$x
+wisconsin_y <- wisconsin_centroid$y
+
+ggplot(data = neighbor_data) +
+  geom_sf(aes(fill = weight), color = "black", lwd = 0.5) +
+  scale_fill_viridis_c() +
+  theme_minimal() +
+  geom_segment(data = neighbor_data[neighbor_data$NAME != "Wisconsin", ],
+               aes(x = wisconsin_x, y = wisconsin_y, xend = x, yend = y),
+               color = "red", size = 0.5, linetype = "solid") +
+  geom_text(aes(x = x, y = y, label = round(weight, 2)), size = 3, color = "white") +
+  theme(legend.position = "bottom") +
+  labs(title = "Spatial Weights of Wisconsin", fill = "Weight") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  
+```
+
+With the spatial weights defined, the only decision left before building the final model is the functional form of each variable. Except for homeowners insurance premiums, all variables will be logged to address outliers. The graphs showing both the logged and unlogged versions of these variables can be found in section a.5 of the appendix. The remaining variables will be kept in their original forms.
+
+The final model is a spatial panel model by maximum likelihood (spml) from the splm package in R (Millo et al. 2012). Using a spml allows me to specify the weights, lags, errors, and effects for the model. Given my research question about the relationship between homeowners insurance premiums and storm damage, the spml is specified as a spatial error model, as I am not interested in analyzing the effect of a state’s premiums on nearby states' premiums. The inverse distance weighted matrix will be used to measure spatial relationships. After indexing the data by state and year to capture the panel aspect of the data, I need to decide between random effects and fixed effects. Random effects should be used if the variable needs to be controlled for to remove its influence, while fixed effects should be used if the variable is expected to influence the response. I expect state and year to influence homeowners insurance premiums because state characteristics that do not change over time should have some unobserved effect on premiums, and the year should capture shocks that affect all states.  
+
+I compared four different fixed effects models using home damage covered by homeowners insurance as the treatment variable. Each model included the same explanatory variables to determine the best final model. Fixed effects demean the data, allowing us to measure the effect of the variables relative to the fixed effects mean rather than just their direct impact. Demeaning centers the data around the variable’s average. For example, if State A's homeowners insurance premium is at its average in 2008, the model assigns it a value of zero because it aligns with its mean. If in 2009, State A’s premium rises $\$5.70$ above its average, then the value becomes 5.70. I use a combination of state and year fixed effects. The example above illustrates how the model demeans the data when using only state fixed effects. If I were to use only year fixed effects, then all 48 states would be centered around the national average across all states. When I include both state and year fixed effects, the model applies both demeaning processes simultaneously. 
+
+The econometric intuition behind using fixed effects is to control for unobservables within and between groups. An unobservable is an effect that isn’t directly included as a variable in our data, but we can still account for it using fixed effects at the state and year levels. Starting with Model 1, I include only state fixed effects, which control for unobserved characteristics within a state that remain constant over time. For example, a state’s location on the coast or in Tornado Alley increases homeowners insurance premiums due to heightened risk of damage, making it a fixed characteristic. Model 2 applies year fixed effects, which account for unobservable shocks that affect all states equally over time. By combining state and year fixed effects, I control for both state-specific and time-specific unobservables. Region fixed effects work similarly to state fixed effects but apply to larger geographic areas. However, because regions encompass more diverse states, it’s harder to assume that unobserved factors remain constant within each region over time. Given this limitation, my final model will use state and year fixed effects. In my analysis, I will compare all fixed effects models to evaluate how they account for unobserved factors and influence the results.
+
+When specifying the spml model in R to create a spatial error model, you can choose between the `b` (Baltagi) or `kkp` (Kapoor) methods (Millo et al., 2012). In my final model, I used Baltagi’s error method, but using Kapoor's error method instead would not have changed the results. This is demonstrated in section a.6 of the appendix, where I re-estimate all four models using the `kkp` error method. In the spml model, I also specified a two-way state and year fixed effects model. Additionally, I set lag to equal FALSE since I only want to control for spatial autocorrelation in the error terms. As mentioned earlier, my focus is on how storm damage affects homeowners insurance premiums, rather than how one state’s premium prices influence those of nearby states. 
+
+The final model is a spatial error model that includes state and year fixed effects. $\epsilon_{it}$ is a vector of spatially autocorrelated observations that follow a spatial autoregressive process (Millo et al. 2012). The Kronecker product of the identity matrix $I_T$ (which represents the time dimension) and the spatial weights matrix $W_N$ (which describes the spatial neighbors) ensures proper structuring of the spatial dependence. The identity matrix is an $11 \times 11$ matrix with ones along its diagonal, meaning that if the values match (i.e., the years align), there is a one. This identity matrix ensures that the model does not allow for temporal correlation. The weight matrix, $W_N$, is a $48 \times 48$ matrix since there are only 48 states in the data. The matrix consists of either zeros or weight values, with each row summing to one. When we take the Kronecker product $I_T \otimes W_N$, the resulting matrix is a massive $528 \times 528$ matrix with zeros everywhere except along the diagonal, where each block is an identical $48 \times 48$ copy of $W_N$. This ensures that the same spatial weights are applied for each state across all years. The spatial autoregressive parameter, $\rho$, captures the strength of spatial dependence between state $i$ and state $j$, constrained to be between -1 and 1. In other words, $\rho$ represents the correlation in the error terms. If there is no spatial correlation in the errors, then $\rho$ will be zero. $\alpha_i$ represents the state fixed effect, while $\alpha_t$ represents the year fixed effect. $\nu_{it}$ is the independent error term, uncorrelated with the spatial error term, capturing any randomness not influenced by spatial factors.
+
+$$
+\begin{split}
+\textrm{homePrems}_{it} &= \alpha_i + \alpha_t + \beta_1 \log(\textrm{home damage}_{it}) + \beta_2 \log(\textrm{disaster damage}_{it}) + \beta_3 \log(\textrm{AvgHomePrice}_{it}) \\
+&{} + \beta_4 \log(\textrm{Percent white}_{it}) + \beta_5 \log(\textrm{PopDensity}_{it}) + \epsilon_{it}, \\
+&\text{where } \epsilon_{it} = \rho (I_T \otimes W_N) \epsilon_{it} + \nu_{it}, \quad |\rho| < 1, \\
+&\nu_{it} \sim \mathcal{N}(0, \sigma^2_{\nu}), \quad \epsilon_{it} \sim \mathcal{N}(0, \sigma^2_{\epsilon}).
+\end{split}
+$$
+
+# Results
+
+First, let's examine the results from different fixed effects models using home damage covered by insurance as the treatment variable. The state fixed effects model produces the smallest coefficient (0.947) and is the only statistically insignificant coefficient for home damage, with a statistically significant p-value being less than 0.1. This suggests that controlling only for time-invariant differences across states does not fully capture the effect of home damage. The year fixed effects model, on the other hand, yields the largest coefficient (4.497) and the most statistically significant result. However, a larger coefficient is not a valid way to determine a better fit, as this model only accounts for common shocks affecting all states and ignores unobserved differences between states. It is likely that the larger coefficient is due to an overestimated, biased model—meaning the model finds a larger coefficient than it should due to improper data fitting. Introducing region and year fixed effects partially addresses this issue, reducing the coefficient to 3.438 while maintaining statistical significance, though to a lesser degree.
+
+Controlling for regions helps account for some unobserved heterogeneity between states, but this assumes states within the same region share identical insurance markets or policy implementation, which is incorrect. Therefore, this approach may still produce an overestimated, biased coefficient. This concern is confirmed when applying state and year fixed effects, which yield a statistically significant coefficient of 1.302. Given the theoretical reasoning behind fixed effects and my research question, controlling for both state and year fixed effects ensures that coefficients reflect within-state variation over time while accounting for nationwide shocks that effect all states equally. For this reason, I will use this model to analyze the rest of the variables. 
+
+```{r}
+# testing some shit
+## Final Model
+# Error
+M1S <- spml(homePrems ~ log(home_damage) + log(disaster_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity),
+                   data = panel_data, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "individual",
+                   lag = FALSE,
+                   spatial.error = "b")
+
+summary_M1S <- summary(M1S)
+
+model1 <- coeftest(summary_M1S)
+```
+
+```{r}
+## Final Model
+# Error
+M1Y <- spml(homePrems ~ log(home_damage) + log(disaster_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity),
+                   data = panel_data, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "time",
+                   lag = FALSE,
+                   spatial.error = "b")
+
+summary_M1Y <- summary(M1Y)
+
+model2 <- coeftest(summary_M1Y)
+```
+
+```{r}
+## Final Model
+# Error
+M1SY <- spml(homePrems ~ log(home_damage) + log(disaster_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity),
+                   data = panel_data, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "twoways",
+                   lag = FALSE,
+                   spatial.error = "b")
+
+summary_M1SY <- summary(M1SY)
+
+model3 <- coeftest(summary_M1SY)
+```
+
+```{r}
+## Final Model
+# Error
+M2Y <- spml(homePrems ~ log(home_damage) + log(disaster_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity) + Region,
+                   data = panel_data, 
+                   index = c("State", "Year"),
+                   listw =  lw,
+                   model = "within",
+                   effect = "time",
+                   lag = FALSE,
+                   spatial.error = "b")
+
+summary_M2Y <- summary(M2Y)
+
+model4 <- coeftest(summary_M2Y)
+```
+
+```{r, warning=FALSE, message=FALSE, results= "asis", include=TRUE}
+stargazer(model1, model2, model4, model3,
+          type = "latex",
+          report = ('vc*p'),
+          single.row = TRUE,
+          digits = 3,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          out = "table.tex",
+          font.size = "footnotesize",
+          add.lines = TRUE,
+          notes.append = FALSE,
+          title = "Regression Models",
+          model.numbers = FALSE,
+          column.labels = c("State FE", "Year FE", "Region FE Year FE", "State FE Year FE")) 
+```
+
+Upon examining the final model in Table 4, we see the expected result: damage that should be covered by home insurance has a positive and statistically significant effect on the price of homeowners premiums. Specifically, when holding damage not covered by home insurance, average home price, percent white, and population density constant, for every 1 percent increase in damage that would be covered by home insurance, we expect to see an average 1.3 cent increase in homeowners insurance premiums. Although this is not a large monetary value, it demonstrates that storms do have an effect on premium prices.
+
+Further, the only other statistically significant coefficient is percent white, which has a negative effect on home premiums. Specifically, for every one percent increase in the white population, homeowners premiums are expected to decrease by $\$4.67$ on average. This finding suggests that racial bias could be a factor, with non-white populations potentially facing higher premiums. However, while discrimination is illegal, it is not impossible. More likely, this result reflects income and wealth disparities or lower credit scores. Coastal states tend to have more diverse populations but also face higher risks of damage and increased demand for coastal living, which could explain why areas with lower percentages of white residents have higher premiums on average.  
+
+Population density, average home price, and damage not covered by home insurance are all not statistically significant. Despite being significant under year and region fixed effects, population density having a p-value of 1 suggests virtually no variation within a specific state over time. This is not surprising, as population growth rates across states are generally similar. At first glance, the lack of a statistically significant result for average home price may seem unexpected. However, after demeaning the data, the rate of change in average home price within a given state over time is likely uniform, reducing the likelihood of statistical significance. Lastly, the insignificance of damage not covered by homeowners insurance is expected, as I explicitly separated damage variables into those that should influence premiums and those that should not. The model finds no evidence of a relationship between uncovered damage and homeowners insurance premiums. 
+
+To visualize the relationships between the explanatory variables and homeowners insurance premiums, I will use partial dependency graphs, as shown in Figure 7. A partial dependency graph holds all other explanatory variables at their means, except for the variable of interest in that specific graph. Since all the variables are logged, I unlogged the x-axis while keeping the line itself logged. This is why the x-axes in the graphs appear to grow exponentially.
+
+```{r, include = TRUE, warning = FALSE, fig.cap = "Partial Dependency Plots", fig.height=6}
+# step 1
+
+independent_var <- "home_damage"  # The variable of interest
+
+panel_data_no_geom <- panel_data %>% 
+  select(where(~ !inherits(.x, "sfc")))
+
+panel_data_no_geom <- as.data.frame(panel_data_no_geom)
+
+logged_means <- panel_data_no_geom %>%
+  summarise(
+    log_home_damage = mean(log(home_damage), na.rm = TRUE),
+    log_disaster_damage = mean(log(disaster_damage), na.rm = TRUE),
+    log_AvgHomePrice = mean(log(AvgHomePrice), na.rm = TRUE),
+    log_Percent_white = mean(log(Percent_white), na.rm = TRUE),
+    log_PopDensity = mean(log(PopDensity), na.rm = TRUE)
+  ) %>%
+  as.list() 
+
+x_range <- seq(min(log(panel_data_no_geom[[independent_var]]), na.rm = TRUE), 
+               max(log(panel_data_no_geom[[independent_var]]), na.rm = TRUE), 
+               length.out = 576)
+
+coeffs <- coef(M1SY)
+
+coeffs <- coeffs[!names(coeffs) %in% "rho"]
+
+new_data <- data.frame(log_home_damage = x_range)
+
+new_data$log_disaster_damage <- logged_means$log_disaster_damage
+new_data$log_AvgHomePrice <- logged_means$log_AvgHomePrice
+new_data$log_Percent_white <- logged_means$log_Percent_white
+new_data$log_PopDensity <- logged_means$log_PopDensity
+
+new_data$predicted_y <- 
+  coeffs[1] * new_data$log_home_damage +
+  coeffs[2] * new_data$log_disaster_damage +
+  coeffs[3] * new_data$log_AvgHomePrice +
+  coeffs[4] * new_data$log_Percent_white +
+  coeffs[5] * new_data$log_PopDensity
+
+graph1 <- ggplot(new_data, aes(x = exp(log_home_damage), y = predicted_y)) +
+  geom_line() +
+  labs(title = "Partial Dependence of home_damage", 
+       x = "home_damage",  
+       y = "Predicted Premium") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 10),
+      axis.text.x = element_text(angle = 45, hjust = 1)) +  
+  ylim(400, 800) +
+  scale_x_continuous(trans = "log", labels = function(x) round(x, 2))
+
+
+# step 2
+
+independent_var <- "disaster_damage"  # The variable of interest
+
+panel_data_no_geom <- panel_data %>% 
+  select(where(~ !inherits(.x, "sfc")))
+
+panel_data_no_geom <- as.data.frame(panel_data_no_geom)
+
+logged_means <- panel_data_no_geom %>%
+  summarise(
+    log_home_damage = mean(log(home_damage), na.rm = TRUE),
+    log_disaster_damage = mean(log(disaster_damage), na.rm = TRUE),
+    log_AvgHomePrice = mean(log(AvgHomePrice), na.rm = TRUE),
+    log_Percent_white = mean(log(Percent_white), na.rm = TRUE),
+    log_PopDensity = mean(log(PopDensity), na.rm = TRUE)
+  ) %>%
+  as.list()  
+
+x_range <- seq(min(log(panel_data_no_geom[[independent_var]]), na.rm = TRUE), 
+               max(log(panel_data_no_geom[[independent_var]]), na.rm = TRUE), 
+               length.out = 576)
+
+coeffs <- coef(M1SY)
+
+coeffs <- coeffs[!names(coeffs) %in% "rho"]
+
+new_data <- data.frame(log_disaster_damage = x_range)
+
+new_data$log_home_damage <- logged_means$log_home_damage
+new_data$log_AvgHomePrice <- logged_means$log_AvgHomePrice
+new_data$log_Percent_white <- logged_means$log_Percent_white
+new_data$log_PopDensity <- logged_means$log_PopDensity
+
+new_data$predicted_y <- 
+  coeffs[1] * new_data$log_home_damage +
+  coeffs[2] * new_data$log_disaster_damage +
+  coeffs[3] * new_data$log_AvgHomePrice +
+  coeffs[4] * new_data$log_Percent_white +
+  coeffs[5] * new_data$log_PopDensity
+
+graph2 <- ggplot(new_data, aes(x = exp(log_disaster_damage), y = predicted_y)) +
+  geom_line() +
+  labs(title = "Partial Dependence of disaster_damage", 
+       x = "disaster_damage",  
+       y = "Predicted Premium") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 10),
+      axis.text.x = element_text(angle = 45, hjust = 1)) +  
+  ylim(400, 800) +
+  scale_x_continuous(trans = "log", labels = function(x) round(x, 2))
+
+
+# step 3
+
+independent_var <- "AvgHomePrice"  # The variable of interest
+
+panel_data_no_geom <- panel_data %>% 
+  select(where(~ !inherits(.x, "sfc")))
+
+panel_data_no_geom <- as.data.frame(panel_data_no_geom)
+
+logged_means <- panel_data_no_geom %>%
+  summarise(
+    log_home_damage = mean(log(home_damage), na.rm = TRUE),
+    log_disaster_damage = mean(log(disaster_damage), na.rm = TRUE),
+    log_AvgHomePrice = mean(log(AvgHomePrice), na.rm = TRUE),
+    log_Percent_white = mean(log(Percent_white), na.rm = TRUE),
+    log_PopDensity = mean(log(PopDensity), na.rm = TRUE)
+  ) %>%
+  as.list()
+
+x_range <- seq(min(log(panel_data_no_geom[[independent_var]]), na.rm = TRUE), 
+               max(log(panel_data_no_geom[[independent_var]]), na.rm = TRUE), 
+               length.out = 576)
+
+coeffs <- coef(M1SY)
+
+coeffs <- coeffs[!names(coeffs) %in% "rho"]
+
+new_data <- data.frame(log_AvgHomePrice = x_range)
+
+new_data$log_disaster_damage <- logged_means$log_disaster_damage
+new_data$log_home_damage <- logged_means$log_home_damage
+new_data$log_Percent_white <- logged_means$log_Percent_white
+new_data$log_PopDensity <- logged_means$log_PopDensity
+
+new_data$predicted_y <- 
+  coeffs[1] * new_data$log_home_damage +
+  coeffs[2] * new_data$log_disaster_damage +
+  coeffs[3] * new_data$log_AvgHomePrice +
+  coeffs[4] * new_data$log_Percent_white +
+  coeffs[5] * new_data$log_PopDensity
+
+graph3 <- ggplot(new_data, aes(x = exp(log_AvgHomePrice), y = predicted_y)) +
+  geom_line() +
+  labs(title = "Partial Dependence of AvgHomePrice", 
+       x = "AvgHomePrice",  
+       y = "Predicted Premium") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 10),
+      axis.text.x = element_text(angle = 45, hjust = 1)) +  
+  ylim(400, 800) +
+  scale_x_continuous(trans = "log", labels = function(x) round(x, 0))
+
+
+# step 4
+
+independent_var <- "Percent_white"  # The variable of interest
+
+panel_data_no_geom <- panel_data %>% 
+  select(where(~ !inherits(.x, "sfc")))
+
+panel_data_no_geom <- as.data.frame(panel_data_no_geom)
+
+logged_means <- panel_data_no_geom %>%
+  summarise(
+    log_home_damage = mean(log(home_damage), na.rm = TRUE),
+    log_disaster_damage = mean(log(disaster_damage), na.rm = TRUE),
+    log_AvgHomePrice = mean(log(AvgHomePrice), na.rm = TRUE),
+    log_Percent_white = mean(log(Percent_white), na.rm = TRUE),
+    log_PopDensity = mean(log(PopDensity), na.rm = TRUE)
+  ) %>%
+  as.list()  # Convert to list for easy indexing
+
+x_range <- seq(min(log(panel_data_no_geom[[independent_var]]), na.rm = TRUE), 
+               max(log(panel_data_no_geom[[independent_var]]), na.rm = TRUE), 
+               length.out = 576)
+
+coeffs <- coef(M1SY)
+
+coeffs <- coeffs[!names(coeffs) %in% "rho"]
+
+new_data <- data.frame(log_Percent_white = x_range)
+
+new_data$log_disaster_damage <- logged_means$log_disaster_damage
+new_data$log_AvgHomePrice <- logged_means$log_AvgHomePrice
+new_data$log_home_damage <- logged_means$log_home_damage
+new_data$log_PopDensity <- logged_means$log_PopDensity
+
+new_data$predicted_y <- 
+  coeffs[1] * new_data$log_home_damage +
+  coeffs[2] * new_data$log_disaster_damage +
+  coeffs[3] * new_data$log_AvgHomePrice +
+  coeffs[4] * new_data$log_Percent_white +
+  coeffs[5] * new_data$log_PopDensity
+
+graph4 <- ggplot(new_data, aes(x = exp(log_Percent_white), y = predicted_y)) +
+  geom_line() +
+  labs(title = "Partial Dependence of Percent_white", 
+       x = "Percent_white",  
+       y = "Predicted Premium") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 10),
+      axis.text.x = element_text(angle = 45, hjust = 1)) +  
+  ylim(400, 800) +
+  scale_x_continuous(trans = "log", labels = function(x) round(x, 2))
+
+
+# step 5
+
+independent_var <- "PopDensity"  # The variable of interest
+
+panel_data_no_geom <- panel_data %>% 
+  select(where(~ !inherits(.x, "sfc")))
+
+panel_data_no_geom <- as.data.frame(panel_data_no_geom)
+
+logged_means <- panel_data_no_geom %>%
+  summarise(
+    log_home_damage = mean(log(home_damage), na.rm = TRUE),
+    log_disaster_damage = mean(log(disaster_damage), na.rm = TRUE),
+    log_AvgHomePrice = mean(log(AvgHomePrice), na.rm = TRUE),
+    log_Percent_white = mean(log(Percent_white), na.rm = TRUE),
+    log_PopDensity = mean(log(PopDensity), na.rm = TRUE)
+  ) %>%
+  as.list() 
+
+x_range <- seq(min(log(panel_data_no_geom[[independent_var]]), na.rm = TRUE), 
+               max(log(panel_data_no_geom[[independent_var]]), na.rm = TRUE), 
+               length.out = 576)
+
+coeffs <- coef(M1SY)
+
+coeffs <- coeffs[!names(coeffs) %in% "rho"]
+
+new_data <- data.frame(log_PopDensity = x_range)
+
+new_data$log_disaster_damage <- logged_means$log_disaster_damage
+new_data$log_AvgHomePrice <- logged_means$log_AvgHomePrice
+new_data$log_Percent_white <- logged_means$log_Percent_white
+new_data$log_home_damage <- logged_means$log_home_damage
+
+new_data$predicted_y <- 
+  coeffs[1] * new_data$log_home_damage +
+  coeffs[2] * new_data$log_disaster_damage +
+  coeffs[3] * new_data$log_AvgHomePrice +
+  coeffs[4] * new_data$log_Percent_white +
+  coeffs[5] * new_data$log_PopDensity
+
+graph5 <- ggplot(new_data, aes(x = exp(log_PopDensity), y = predicted_y)) +
+  geom_line() +
+  labs(title = "Partial Dependence of PopDensity", 
+       x = "PopDensity",  # Change x-axis label
+       y = "Predicted Premium") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 10),
+      axis.text.x = element_text(angle = 45, hjust = 1)) +  
+  ylim(400, 800) +
+  scale_x_continuous(trans = "log", labels = function(x) round(x, 0))  
+
+grid.arrange(graph1, graph2, graph3, graph4, graph5, ncol = 2)
+
+```
+
+Percent white has by far the largest effect, showing an approximate total impact of $\$400$ on premiums between the minimum and maximum values of percent white, holding other explanatory variables constant. In contrast, population density has little influence, with a potential effect of only about a dollar. Disaster damage, which is negatively correlated with premiums, could reflect the need for additional insurance plans, such as flood or hurricane insurance, leading to reduced premiums. However, since disaster damage is statistically insignificant, there is no clear relationship, suggesting it does not affect premiums. The positive effect of average home price on premiums makes intuitive sense, but it is also statistically insignificant, indicating no evidence of a relationship between home prices and homeowners insurance premiums. As mentioned earlier, this is likely due to the uniform increase in home prices across the U.S. and the lack of variability remaining after accounting for state and year fixed effects. Damage covered by home insurance has a statistically significant positive effect on premiums, with the potential to increase the price by $\$50$. However, while this effect is small compared to percent white, damage that would be covered by homeowners insurance can affect the price of premiums, though it mostly appears to be significant only in extreme cases.
+
+# Conclusion 
+
+Using a spatial error panel model by maximum likelihood while controlling for state and year fixed effects best fits the data and my research question of whether there is a positive statistically significant relationship between homeowners insurance premiums and damage caused by storms between 2008 and 2019. The results provide evidence of a positive relationship. With the growing literature on the increasing risks from climate change, policymakers should focus on ways to reduce the costs homeowners face and find solutions to mitigate the effects of climate change. Areas like California are becoming too risky to insure, leading insurance companies to pull their services from the state. Steps need to be taken to ensure that people in high-risk areas can access affordable homeowners insurance. 
+
+The results I found align with my intuitive expectations, but these results are not causal. Lack of access to county-level data limits the accuracy of the estimates, and not having data on reinsurance rates also affects the analysis. Reinsurance, often referred to as insurance for insurance companies, significantly impacts premium prices (Investopedia). Omitting this variable weakens the causal claims this paper can make, but I expect to find similar results with its inclusion. 
+
+The model was also unable to account for temporal correlation due to the nature of the identity matrix, where the weights remained the same over time. However, to fully capture the spatial and temporal relationship between homeowners insurance premiums and storm damage, there should be weights that change over time. Future research should explore methods that incorporate both temporal and spatial parameters, as doing so would likely produce a larger effect from damage covered by homeowners insurance.
+
+# References 
+
+Baltagi, Badi H., Seuck Heun Song, and Won Koh. Testing Panel Data Regression Models with Spatial Error Correlation. Department of Economics, Texas A&M University, 2001, https://econpapers.repec.org/cpd/2002/24_Baltagi.pdf. 
+
+Baltagi, Badi H., Peter Egger, and Michael Pfaffermayr. A Generalized Spatial Panel Data Model with Random Effects. 2007, https://economics.ucr.edu/wp-content/uploads/2019/11/Baltagi.pdf. 
+
+Bivand, Roger, et al. splm: Spatial Panel Data Models. CRAN, https://cran.rproject.org/web/packages/splm/splm.pdf. 
+
+Burchfield, Emily. Spatial Regression Lab. https://www.emilyburchfield.org/courses/gsa/spatial_regression_lab. 
+
+Investopedia. Reinsurance. https://www.investopedia.com/terms/r/reinsurance.asp. 
+
+Keys and Mulder. Property Insurance and Disaster Risk: New Evidence from Mortgage Escrow Data. NBER Working Paper No. 32579, National Bureau of Economic Research, 2024, https://www.nber.org/system/files/working_papers/w32579/w32579.pdf. 
+
+Federal Emergency Management Agency (FEMA). Expected Annual Loss. https://hazards.fema.gov/nri/expected-annual-loss. 
+
+Millo, Giovanni, and Gianfranco Piras. splm: Spatial Panel Data Models in R. Journal of Statistical Software, vol. 47, no. 1, 2012, pp. 1–38. https://www.jstatsoft.org/article/view/v047i01. 
+
+Moscone, Fosca, and Giuseppe Tosetti. "GMM Estimation of Spatial Panels with Fixed Effects and Unknown Heteroskedasticity." Journal of Econometrics, vol. 41, no. 5, 2011, pp. 487-497. ScienceDirect, https://www.sciencedirect.com/science/article/abs/pii/S0166046211000445. 
+
+Princeton University Library. R Guide: Panel Data Analysis. https://libguides.princeton.edu/R-Panel. 
+Stack Overflow. R plm Time Fixed Effect Model. Stack Exchange, https://stackoverflow.com/questions/28359491/r-plm-time-fixed-effect-model. 
+
+Yang, Zhenlin. "Quasi-Maximum Likelihood Estimation for Spatial Panel Data Regressions." Research Collection School of Economics, Singapore Management University, 2013, https://ink.library.smu.edu.sg/cgi/viewcontent.cgi?article=2574&context=soe_research 
+
+## Data Sources 
+
+National Centers for Environmental Information. Storm Events Database. National Oceanic and Atmospheric Administration, https://www.ncdc.noaa.gov/stormevents/. 
+
+Kaiser Family Foundation. Total Number of Residents. https://www.kff.org/other/state-indicator/total-residents/?activeTab=graph&currentTimeframe=0&startTimeframe=14&sortModel=%7B%22colId%22:%22Location%22,%22sort%22:%22asc%22%7D. 
+
+Kaiser Family Foundation. Distribution by Race/Ethnicity. https://www.kff.org/other/state-indicator/distribution-by-raceethnicity/currentTimeframe=0&sortModel=%7B%22colId%22:%22Location%22,%22sort%22:%22asc%22%7D. 
+
+Zillow. Zillow Research Data. https://www.zillow.com/research/data/. 
+
+U.S. Census Bureau. State Area Measurements and Internal Point Coordinates. U.S. Department of Commerce, https://www.census.gov/geographies/reference-files/2010/geo/state-area.html. 
+
+# Appendix  
+
+## a.1
+
+Table 5 shows the regression results of the base fixed effects model, where the effects of both damage variables are similar to their effects in our final model. However, the major differences are observed in the control variables. Percent white now has a positive but insignificant effect, while both average home price and population density are statistically significant. The significant variables make sense as well. Home prices in high-risk areas tend to decrease, while premiums increase (Dumm et al., 2012). Additionally, more densely populated areas are expected to have higher risk, which justifies the significance of population density.
+
+```{r, warning=FALSE, message=FALSE, results= "asis", include=TRUE}
+stargazer(fixed_effects_model,
+          type = "latex",
+          report = ('vc*p'),
+          single.row = TRUE,
+          digits = 3,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          out = "table.tex",
+          font.size = "footnotesize",
+          notes.append = FALSE,
+          title = "Regression Models",
+          model.numbers = FALSE,
+          column.labels = c("Fixed Effects Model"))
+```
+
+## a.2
+
+Figure 8 illustrates how the radius of a polygon determines whether nearby polygons are considered neighbors. As the figure shows, the centroid of a polygon must fall within the radius to be counted as a neighbor.
+
+```{r, fig.cap= "Distance based neighbors", include=TRUE, out.width="70%", out.height="70%"}
+knitr::include_graphics("C:/Users/timmy/Desktop/School Files/Capstone/Screenshot 2025-03-17 185846.png")
+```
+
+\newpage
+
+## a.3
+
+Figure 9 shows the differences between rook and queen contiguity. This paper used manual rook contiguity in combination with distance-based neighbors.
+
+```{r, fig.cap= "Rook vs. Queen Contiguity", include = TRUE, warning = FALSE}
+knitr::include_graphics("C:/Users/timmy/Desktop/School Files/Capstone/Screenshot 2025-02-27 120832.png")
+```
+
+## a.4
+
+The inverse distance weighting equation, where the numerator is the inverse distance between state i's centroid and neighbor j's centroid, and the denominator is the sum of all the inverse distances between state i and all of its k neighbors. Dividing by the denominator ensures that the sum of all the weights for state i equals 1.
+
+$$
+\begin{split}
+w_{ij} = \frac{\frac{1}{d_{ij}}}{\sum\limits_{k \in N_i} \frac{1}{d_{ik}}}  
+\end{split}
+$$
+
+## a.5
+Data visualizations of both the logged and unlogged versions of each variable. 
+
+### Home Damage
+```{r, include=TRUE}
+# Plot for before log transformation
+before <- ggplot(model_ready, aes(home_damage, homePrems)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  
+  labs(
+    title = "Before Log Transformation",
+    x = "Home Damage",
+    y = "Average Premiums")
+
+# Plot for after log transformation
+after <- ggplot(model_ready, aes(log(home_damage), homePrems)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  
+  labs(
+    title = "After Log Transformation",
+    x = "Log of Home Damage",
+    y = "Average Premiums")
+
+grid.arrange(before, after, ncol = 2)
+```
+
+### Disaster Damage
+```{r, include=TRUE}
+# Plot for before log transformation
+before <- ggplot(model_ready, aes(disaster_damage, homePrems)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  
+  labs(
+    title = "Before Log Transformation",
+    x = "Disaster Damage",
+    y = "Average Premiums")
+
+# Plot for after log transformation
+after <- ggplot(model_ready, aes(log(disaster_damage), homePrems)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  
+  labs(
+    title = "After Log Transformation",
+    x = "Log of Disaster Damage",
+    y = "Average Premiums")
+
+grid.arrange(before, after, ncol = 2)
+```
+
+### Percent White 
+```{r, include=TRUE}
+# Plot for before log transformation
+before <- ggplot(model_ready, aes(Percent_white, homePrems)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  
+  labs(
+    title = "Before Log Transformation",
+    x = "Percent White",
+    y = "Average Premiums")
+
+# Plot for after log transformation
+after <- ggplot(model_ready, aes(log(Percent_white), homePrems)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  
+  labs(
+    title = "After Log Transformation",
+    x = "Log of Percent White",
+    y = "Average Premiums")
+
+grid.arrange(before, after, ncol = 2)
+```
+
+### Average Home Price 
+```{r, include=TRUE}
+# Plot for before log transformation
+before <- ggplot(model_ready, aes(AvgHomePrice, homePrems)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  
+  labs(
+    title = "Before Log Transformation",
+    x = "Average Home Price",
+    y = "Average Premiums")
+
+# Plot for after log transformation
+after <- ggplot(model_ready, aes(log(AvgHomePrice), homePrems)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  
+  labs(
+    title = "After Log Transformation",
+    x = "Log of Average Home Price",
+    y = "Average Premiums")
+
+grid.arrange(before, after, ncol = 2)
+```
+
+### Population Density
+
+```{r, include=TRUE}
+# Plot for before log transformation
+before <- ggplot(model_ready, aes(PopDensity, homePrems)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  
+  labs(
+    title = "Before Log Transformation",
+    x = "Population Density",
+    y = "Average Premiums")
+
+# Plot for after log transformation
+after <- ggplot(model_ready, aes(log(PopDensity), homePrems)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  
+  labs(
+    title = "After Log Transformation",
+    x = "Log of Population Density",
+    y = "Average Premiums")
+
+grid.arrange(before, after, ncol = 2)
+```
+
+## a.6
+
+The same models were used in the paper; however, instead of using the Baltagi (b) error method, I used the Kapoor (kkp) error method. This approach produces almost identical results to when I used Baltagi's error method.
+
+```{r, include=TRUE}
+# testing some shit
+## Final Model
+# Error
+M1S <- spml(homePrems ~ log(home_damage) + log(disaster_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity),
+                   data = panel_data, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "individual",
+                   lag = FALSE,
+                   spatial.error = "kkp")
+
+summary_M1S <- summary(M1S)
+
+model1 <- coeftest(summary_M1S)
+```
+
+```{r, include=TRUE}
+## Final Model
+# Error
+M1Y <- spml(homePrems ~ log(home_damage) + log(disaster_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity),
+                   data = panel_data, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "time",
+                   lag = FALSE,
+                   spatial.error = "kkp")
+
+summary_M1Y <- summary(M1Y)
+
+model2 <- coeftest(summary_M1Y)
+```
+
+```{r, include=TRUE}
+## Final Model
+# Error
+M1SY <- spml(homePrems ~ log(home_damage) + log(disaster_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity),
+                   data = panel_data, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "twoways",
+                   lag = FALSE,
+                   spatial.error = "kkp")
+
+summary_M1SY <- summary(M1SY)
+
+model3 <- coeftest(summary_M1SY)
+```
+
+```{r, include=TRUE}
+## Final Model
+# Error
+M2Y <- spml(homePrems ~ log(home_damage) + log(disaster_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity) + Region,
+                   data = panel_data, 
+                   index = c("State", "Year"),
+                   listw =  lw,
+                   model = "within",
+                   effect = "time",
+                   lag = FALSE,
+                   spatial.error = "kkp")
+
+summary_M2Y <- summary(M2Y)
+
+model4 <- coeftest(summary_M2Y)
+```
+
+```{r, warning=FALSE, message=FALSE, results= "asis", include=TRUE}
+stargazer(model1, model2, model4, model3,
+          type = "latex",
+          report = ('vc*p'),
+          single.row = TRUE,
+          digits = 3,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          out = "table.tex",
+          font.size = "footnotesize",
+          add.lines = TRUE,
+          notes.append = FALSE,
+          title = "Regression Models",
+          model.numbers = FALSE,
+          column.labels = c("State FE", "Year FE", "Region FE Year FE", "State FE Year FE")) 
+```
+

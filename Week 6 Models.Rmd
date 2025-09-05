@@ -1,0 +1,1089 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-02-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(ggplot2)
+library(tidyverse)
+library(dplyr)
+library(stargazer)
+library(knitr)
+library(kableExtra)
+library(plm)
+library(lme4)
+library(sf)
+library(leaflet)
+library(spdep)
+library(spatialreg)
+library(sp)
+library(terra)
+library(tmap)
+library(splm)
+library(plm)
+library(corrplot)
+library(gridExtra)
+library(car)
+library(lmtest)
+```
+
+# Loading in Data
+
+```{r}
+df <- read.csv("C:/Users/timmy/Desktop/School Files/Capstone/Final CSVs/Final Spatial Data Natural Hazards.csv")
+states_sf <- st_read("C:/Users/timmy/Desktop/School Files/Capstone/tl_2024_us_state.shp", promote_to_multi = FALSE)
+
+df$State <- as.factor(df$State)
+```
+
+```{r}
+#states_sf <- st_cast(states_sf, "POLYGON")
+
+states_sf <- states_sf %>%
+  rename(State = NAME)
+
+# Temporarily save geometry and attributes separately
+geometry <- st_geometry(states_sf)
+attributes <- st_drop_geometry(states_sf)
+
+# Expand attributes to include all years
+expanded_attributes <- attributes %>%
+  mutate(dummy = 1) %>%  
+  expand_grid(Year = 2008:2019) %>%  
+  select(-dummy)  
+
+# Combine expanded attributes with original geometry
+states_sf <- st_sf(expanded_attributes, geometry = rep(geometry, each = length(2008:2019)))
+```
+
+# Data Wrangling
+
+```{r}
+df_test <- df 
+#df_test$Percent_white <- df_test$Percent_white * 100
+
+#df_test$DAMAGE_PROPERTY <- df_test$DAMAGE_PROPERTY / 1000
+#df_test$DAMAGE_CROPS <- df_test$DAMAGE_CROPS / 1000
+```
+
+```{r}
+final_df <- states_sf %>%
+  inner_join(df_test, by = c("State", "Year"))
+```
+
+```{r}
+final_df <- final_df %>%
+  filter(!State %in% c("Hawaii", "Alaska"))
+
+final_df <- final_df %>%
+  select(-total_damage_property.y, -total_damage_crops.y) %>%  
+  rename(
+    total_damage_property = total_damage_property.x,  
+    total_damage_crops = total_damage_crops.x  
+  )
+
+#model_ready <- final_df %>%
+  #arrange(Year, State)  %>% 
+  #mutate(total_damage = total_damage_property + total_damage_crops) %>% 
+  #mutate(td_per_cap = total_damage / Total_Residents)
+
+model_ready <- final_df %>%
+  arrange(Year, State)  %>% 
+  mutate(total_damage = total_damage_property) %>% 
+  mutate(td_per_cap = total_damage / Total_Residents)
+
+model_ready <- model_ready %>%
+  rename(
+    homePrems = Home.Avg.Premium,
+    rentersPrems = Renters.Avg.Premium,
+    HealthcareExp = Health.Spending.per.Capita,
+    Pop18_64 = Total_Pop_Dis,
+    Uninsured = Percent.Adults.19.64.Uninsured,
+    Medicaid = Percent,
+    PriceDef = RegionalPriDef,
+    Coastal = Is_Coastal,
+    MedHomeIncome = Median.Income,
+    AvgHomePrice = Avg_Home_Price,
+    RiskIndex = National_Risk_Index_Score_Composite,
+    ExpAnnualLoss = Expected.Annual.Loss...Score...Composite
+  )
+```
+
+
+```{r}
+geometry <- st_geometry(model_ready)  
+model_ready_no_geom <- model_ready %>%
+  st_drop_geometry()
+
+sev_weather_property_cols <- names(model_ready_no_geom) %>%
+  str_subset("damage_property_(tornado|excessive_heat|heavy_snow|high_wind|hail|winter_storm|blizzard|ice_storm|strong_wind|lightning)")
+
+sev_weather_crops_cols <- names(model_ready_no_geom) %>%
+  str_subset("damage_crops_(tornado|excessive_heat|heavy_snow|high_wind|hail|winter_storm|blizzard|ice_storm|strong_wind|lightning)")
+
+disaster_property_cols <- names(model_ready_no_geom) %>%
+  str_subset("damage_property_(hurricane|flood|flash_flood|storm_surge_tide|wildfire|coastal_flood|lakeshore_flood|tsunami)")
+
+disaster_crops_cols <- names(model_ready_no_geom) %>%
+  str_subset("damage_crops_(hurricane|flood|flash_flood|storm_surge_tide|wildfire|coastal_flood|lakeshore_flood|tsunami)")
+
+model_ready_no_geom <- model_ready_no_geom %>%
+  mutate(
+    num_sev_weather_property = rowSums(select(., all_of(sev_weather_property_cols)), na.rm = TRUE),
+    num_sev_weather_crops = rowSums(select(., all_of(sev_weather_crops_cols)), na.rm = TRUE),
+    disasters_property = rowSums(select(., all_of(disaster_property_cols)), na.rm = TRUE),
+    disasters_crops = rowSums(select(., all_of(disaster_crops_cols)), na.rm = TRUE)
+  ) %>%
+  mutate(
+    home_damage = num_sev_weather_property + num_sev_weather_crops,
+    disaster_damage = disasters_property + disasters_crops,
+    combined_damage = home_damage + disaster_damage + 2000,
+    climate_index = combined_damage / RiskIndex,
+    building_risk = (ExpAnnualLoss / Total_Value) * PriceDef,
+    realized_damaged = (combined_damage / ExpAnnualLoss) * RiskIndex,
+    actual_NRI = (combined_damage) * (Social/ Community)
+  )
+
+model_ready <- st_sf(model_ready_no_geom, geometry = geometry)
+```
+
+```{r}
+states <- c("Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado", "Connecticut", 
+            "Delaware", "Florida", "Georgia", "Hawaii", "Idaho", "Illinois", "Indiana", 
+            "Iowa", "Kansas", "Kentucky", "Louisiana", "Maine", "Maryland", 
+            "Massachusetts", "Michigan", "Minnesota", "Mississippi", "Missouri", "Montana", 
+            "Nebraska", "Nevada", "New Hampshire", "New Jersey", "New Mexico", "New York", 
+            "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon", "Pennsylvania", 
+            "Rhode Island", "South Carolina", "South Dakota", "Tennessee", "Texas", 
+            "Utah", "Vermont", "Virginia", "Washington", "West Virginia", "Wisconsin", 
+            "Wyoming")
+
+square_miles <- c(52420, 665384, 113990, 53179, 163695, 104094, 5543, 2489, 65758, 59425, 10932, 83569, 
+                  57914, 36420, 56273, 82278, 40408, 52378, 35380, 12406, 10554, 96714, 86936, 48432, 
+                  69707, 147040, 77348, 110572, 9349, 8723, 121590, 54555, 53819, 70698, 44826, 
+                  69899, 98379, 46054, 1545, 32020, 77116, 42144, 268596, 84897, 9616, 42775, 71298, 
+                  24230, 65496, 97813) # Census Bureau 
+
+years <- rep(2008:2019, each = length(states))
+
+state_area <- data.frame(State = rep(states, times = length(2008:2019)),
+                       Square_Miles = rep(square_miles, times = length(2008:2019)),
+                       Year = years)
+
+state_area <- state_area[!state_area$State %in% c("Alaska", "Hawaii"), ]
+
+model_ready <- model_ready %>% 
+  left_join(state_area, by = c("State", "Year"))
+
+model_ready$PopDensity <- model_ready$Total_Residents / model_ready$Square_Miles
+
+model_ready <- model_ready %>%
+  mutate(Region = case_when(
+    State %in% c("Connecticut", "Delaware", "Maine", "Maryland", "Massachusetts", "New Hampshire", 
+                 "New Jersey", "New York", "Pennsylvania", "Rhode Island", "Vermont") ~ "Northeast",
+    State %in% c("Iowa", "Michigan", "Minnesota", "Wisconsin") ~ "Upper Midwest",
+    State %in% c("Illinois", "Indiana", "Kentucky", "Missouri", "Ohio", "Tennessee", "West Virginia") ~ "Ohio Valley",
+    State %in% c("Alabama", "Florida", "Georgia", "North Carolina", "South Carolina", "Virginia") ~ "Southeast",
+    State %in% c("Montana", "Nebraska", "North Dakota", "South Dakota", "Wyoming") ~ "Northern Rockies and Plains",
+    State %in% c("Arkansas", "Kansas", "Louisiana", "Mississippi", "Oklahoma", "Texas") ~ "South",
+    State %in% c("Arizona", "Colorado", "New Mexico", "Utah") ~ "Southwest",
+    State %in% c("Idaho", "Oregon", "Washington") ~ "Northwest",
+    State %in% c("California", "Nevada") ~ "West",
+    TRUE ~ "Unknown"  # Default case for unmatched states
+  ))
+
+
+model_ready <- model_ready %>%
+  arrange(Year, State)
+
+### STATE-YEAR FIXED EFFECTS ###
+model_ready <- model_ready %>% 
+  mutate(RegionYearFE = paste(Region,Year, sep= "-"))
+```
+
+```{r}
+model_ready_scaled <- model_ready %>%
+  mutate(across(c(homePrems, PriceDef, disaster_damage, PopDensity, td_per_cap, MedHomeIncome, home_damage, Percent_white, AvgHomePrice, ExpAnnualLoss, RiskIndex, Total_Buidling_Value, combined_damage, climate_index, building_risk, realized_damaged, actual_NRI), 
+                ~ {
+                  scaled_value <- (.-min(.)) / (max(.) - min(.))
+                  scaled_value[scaled_value == 0] <- 0.00000000000001
+                  scaled_value
+                }))
+```
+
+```{}
+nb <- model_ready %>%
+  filter(Year %in% c(2011))
+
+# Precompute neighbors from polygon geometries
+neighbors <- poly2nb(nb, queen = FALSE , snap = 0.0001)
+
+# Convert neighbors to spatial weights matrix (static for all years)
+lw <- nb2listw(neighbors, style = "W", zero.policy = TRUE) # equal weights (B, W, C, U, S) 
+
+#B is the basic binary coding, W is row standardised (sums over all links to n), C is globally standardised (sums over all links to n), U is equal to C divided by the number of neighbours (sums over all links to unity), while S is the variance-stabilizing coding scheme proposed by Tiefelsdorf et al. 1999, p. 167-168 (sums over all links to n).
+
+# Function to replicate weights and neighbors while maintaining class attributes and style (NOT USED FOR SPATIAL PLM)
+replicate_listw <- function(lw, times) {
+  replicated_weights <- rep(lw$weights, times)
+  replicated_neighbours <- do.call("c", replicate(times, lw$neighbours, simplify = FALSE))
+  
+  # Ensure neighbours has correct nb structure and region.id is a character
+  class(replicated_neighbours) <- class(lw$neighbours)
+  
+  # create listw structure, copying the structure of lw
+  expanded_weights <- list(
+    style = lw$style,  # Place style first
+    neighbours = replicated_neighbours,  # Place neighbours second
+    weights = replicated_weights  # Place weights last
+  )
+  class(expanded_weights) <- class(lw)
+  
+  return(expanded_weights)
+}
+
+# Determine the number of years
+num_years <- length(unique(final_df$Year))
+num_rows <- nrow(final_df)
+num_reps <- num_rows / length(lw$weights)
+
+weights_across_years <- replicate_listw(lw, num_reps)
+
+# Verify the class and summary of the extended listw object and rows num
+print(class(weights_across_years))  
+print(class(weights_across_years$neighbours))  
+print(weights_across_years$style)  
+
+print(length(weights_across_years$weights))  
+print(length(weights_across_years$neighbours)) 
+
+# Plot neighbors connections
+plot(st_geometry(nb), border = "black") # plot polygons with gray borders
+plot(neighbors, st_coordinates(st_centroid(st_geometry(nb))), add = TRUE, col = "blue", lwd = 1.5)
+```
+
+
+```{r}
+nb <- model_ready %>%
+  filter(Year %in% c(2011))
+
+centroids <- st_centroid(nb)  # This should already be in 'sf' format
+
+centroids_sp <- as(centroids, "Spatial")
+
+dist_matrix <- spDists(centroids_sp)
+
+# Create neighbors list
+neighbors <- dnearneigh(centroids_sp, 0, 525)
+
+# Define row indices for California, Arizona, and Oregon
+california_index <- 4L  # Ensure it's an integer
+arizona_index <- 2L
+oregon_index <- 35L
+
+neighbors[[california_index]] <- sort(unique(as.integer(c(neighbors[[california_index]], arizona_index, oregon_index))))
+neighbors[[arizona_index]] <- sort(unique(as.integer(c(neighbors[[arizona_index]], california_index))))
+neighbors[[oregon_index]] <- sort(unique(as.integer(c(neighbors[[oregon_index]], california_index))))
+
+# Define row indices for Florida and its neighboring states
+florida_index <- 8L  # Replace X with Florida's row index
+mississippi_index <- 22L  # Replace Y with Mississippi's row index
+alabama_index <- 1L   # Replace Z with Alabama's row index
+south_carolina_index <- 38L  # Replace A with South Carolina's row index
+louisiana_index <- 16L  # Replace B with Louisiana's row index
+
+# Update the neighbors list
+neighbors[[florida_index]] <- sort(unique(as.integer(c(neighbors[[florida_index]], mississippi_index, alabama_index, south_carolina_index))))
+neighbors[[mississippi_index]] <- sort(unique(as.integer(c(neighbors[[mississippi_index]], florida_index))))
+neighbors[[alabama_index]] <- sort(unique(as.integer(c(neighbors[[alabama_index]], florida_index))))
+neighbors[[south_carolina_index]] <- sort(unique(as.integer(c(neighbors[[south_carolina_index]], florida_index))))
+
+
+# Define row indices for Texas and its neighboring states
+texas_index <- 41L  # Replace X with Texas's row index
+new_mexico_index <- 29L  # Replace Y with New Mexico's row index
+arkansas_index <- 3L  # Replace A with Arkansas's row index
+
+# Update the neighbors list
+neighbors[[texas_index]] <- sort(unique(as.integer(c(neighbors[[texas_index]], new_mexico_index, louisiana_index, arkansas_index))))
+neighbors[[new_mexico_index]] <- sort(unique(as.integer(c(neighbors[[new_mexico_index]], texas_index))))
+neighbors[[louisiana_index]] <- sort(unique(as.integer(c(neighbors[[louisiana_index]], texas_index))))
+neighbors[[arkansas_index]] <- sort(unique(as.integer(c(neighbors[[arkansas_index]], texas_index))))
+
+# Define row indices for Colorado, Kansas, and Nebraska
+colorado_index <- 5L  # Replace X with Colorado's row index
+kansas_index <- 14L  # Replace Y with Kansas's row index
+nebraska_index <- 25L  # Replace Z with Nebraska's row index
+
+# Update the neighbors list
+neighbors[[colorado_index]] <- sort(unique(as.integer(c(neighbors[[colorado_index]], kansas_index, nebraska_index))))
+neighbors[[kansas_index]] <- sort(unique(as.integer(c(neighbors[[kansas_index]], colorado_index))))
+neighbors[[nebraska_index]] <- sort(unique(as.integer(c(neighbors[[nebraska_index]], colorado_index))))
+
+# Define row indices for Idaho, Utah, and Wyoming
+idaho_index <- 10L  # Replace X with Idaho's row index
+utah_index <- 42L  # Replace Y with Utah's row index
+wyoming_index <- 48L  # Replace Z with Wyoming's row index
+
+# Update the neighbors list
+neighbors[[idaho_index]] <- sort(unique(as.integer(c(neighbors[[idaho_index]], utah_index, wyoming_index))))
+neighbors[[utah_index]] <- sort(unique(as.integer(c(neighbors[[utah_index]], idaho_index, wyoming_index))))
+neighbors[[wyoming_index]] <- sort(unique(as.integer(c(neighbors[[wyoming_index]], idaho_index, utah_index))))
+
+
+# Update the neighbors list
+neighbors[[nebraska_index]] <- sort(unique(as.integer(c(neighbors[[nebraska_index]], kansas_index, wyoming_index))))
+neighbors[[kansas_index]] <- sort(unique(as.integer(c(neighbors[[kansas_index]], nebraska_index))))
+neighbors[[wyoming_index]] <- sort(unique(as.integer(c(neighbors[[wyoming_index]], nebraska_index))))
+
+
+# Define row indices for Washington and Idaho
+washington_index <- 45L  # Replace X with Washington's row index
+
+# Update the neighbors list
+neighbors[[washington_index]] <- sort(unique(as.integer(c(neighbors[[washington_index]], idaho_index))))
+neighbors[[idaho_index]] <- sort(unique(as.integer(c(neighbors[[idaho_index]], washington_index))))
+
+# Define row indices for Nevada and Idaho
+nevada_index <- 26L  # Replace X with Nevada's row index
+
+# Update the neighbors list
+neighbors[[nevada_index]] <- sort(unique(as.integer(c(neighbors[[nevada_index]], idaho_index))))
+neighbors[[idaho_index]] <- sort(unique(as.integer(c(neighbors[[idaho_index]], nevada_index))))
+
+# Update the neighbors list
+neighbors[[new_mexico_index]] <- sort(unique(as.integer(c(neighbors[[new_mexico_index]], arizona_index))))
+neighbors[[arizona_index]] <- sort(unique(as.integer(c(neighbors[[arizona_index]], new_mexico_index))))
+
+# Define row indices for Montana, South Dakota, and North Dakota
+montana_index <- 24L  # Replace X with Montana's row index
+south_dakota_index <- 39L  # Replace Y with South Dakota's row index
+north_dakota_index <- 32L # Replace Z with North Dakota's row index
+
+# Update the neighbors list
+neighbors[[montana_index]] <- sort(unique(as.integer(c(neighbors[[montana_index]], south_dakota_index, north_dakota_index))))
+neighbors[[south_dakota_index]] <- sort(unique(as.integer(c(neighbors[[south_dakota_index]], montana_index, north_dakota_index))))
+neighbors[[north_dakota_index]] <- sort(unique(as.integer(c(neighbors[[north_dakota_index]], montana_index, south_dakota_index))))
+
+# Update the neighbors list
+neighbors[[wyoming_index]] <- sort(unique(as.integer(c(neighbors[[wyoming_index]], south_dakota_index))))
+neighbors[[south_dakota_index]] <- sort(unique(as.integer(c(neighbors[[south_dakota_index]], wyoming_index))))
+
+# Define row indices for Kentucky and Virginia
+kentucky_index <- 15L  # Replace X with Kentucky's row index
+virginia_index <- 44L  # Replace Y with Virginia's row index
+
+# Update the neighbors list
+neighbors[[kentucky_index]] <- sort(unique(as.integer(c(neighbors[[kentucky_index]], virginia_index))))
+neighbors[[virginia_index]] <- sort(unique(as.integer(c(neighbors[[virginia_index]], kentucky_index))))
+
+# Define row indices for Tennessee and North Carolina
+tennessee_index <- 40  # Replace Z with Tennessee's row index
+north_carolina_index <- 31L  # Replace A with North Carolina's row index
+
+# Update the neighbors list
+neighbors[[tennessee_index]] <- sort(unique(as.integer(c(neighbors[[tennessee_index]], north_carolina_index))))
+neighbors[[north_carolina_index]] <- sort(unique(as.integer(c(neighbors[[north_carolina_index]], tennessee_index))))
+
+# Update the neighbors list
+neighbors[[utah_index]] <- sort(unique(as.integer(c(neighbors[[utah_index]], arizona_index))))
+neighbors[[arizona_index]] <- sort(unique(as.integer(c(neighbors[[arizona_index]], utah_index))))
+
+# Update the neighbors list
+neighbors[[arkansas_index]] <- sort(unique(as.integer(c(neighbors[[arkansas_index]], tennessee_index))))
+neighbors[[tennessee_index]] <- sort(unique(as.integer(c(neighbors[[tennessee_index]], arkansas_index))))
+
+# Define row indices for Missouri and Kentucky
+missouri_index <- 23L  # Replace Z with Missouri's row index
+
+# Update the neighbors list
+neighbors[[missouri_index]] <- sort(unique(as.integer(c(neighbors[[missouri_index]], kentucky_index))))
+neighbors[[kentucky_index]] <- sort(unique(as.integer(c(neighbors[[kentucky_index]], missouri_index))))
+
+# Define row indices for Michigan and Indiana
+michigan_index <- 20L  # Replace X with Michigan's row index
+indiana_index <- 12L  # Replace Y with Indiana's row index
+
+# Update the neighbors list
+neighbors[[michigan_index]] <- sort(unique(as.integer(c(neighbors[[michigan_index]], indiana_index))))
+neighbors[[indiana_index]] <- sort(unique(as.integer(c(neighbors[[indiana_index]], michigan_index))))
+
+# Define row indices for Michigan and Illinois
+illinois_index <- 11L  # Replace Y with Illinois's row index
+
+# Update the neighbors list
+neighbors[[michigan_index]] <- sort(unique(as.integer(c(neighbors[[michigan_index]], illinois_index))))
+neighbors[[illinois_index]] <- sort(unique(as.integer(c(neighbors[[illinois_index]], michigan_index))))
+
+iowa_index <- 13L  # Replace Y with Iowa's row index
+
+# Update the neighbors list
+neighbors[[south_dakota_index]] <- sort(unique(as.integer(c(neighbors[[south_dakota_index]], iowa_index))))
+neighbors[[iowa_index]] <- sort(unique(as.integer(c(neighbors[[iowa_index]], south_dakota_index))))
+
+# Define row indices for Nevada, Arizona, and Oregon
+oregon_index <- 35L  # Replace Z with Oregon's row index
+
+# Update the neighbors list
+neighbors[[arizona_index]] <- sort(unique(as.integer(c(neighbors[[arizona_index]], nevada_index))))  # Arizona only neighbors with Nevada
+neighbors[[nevada_index]] <- sort(unique(as.integer(c(neighbors[[nevada_index]], arizona_index, oregon_index))))  # Nevada neighbors with Arizona & Oregon
+neighbors[[oregon_index]] <- sort(unique(as.integer(c(neighbors[[oregon_index]], nevada_index))))  # Oregon neighbors with Nevada
+
+# Update the neighbors list for Colorado and Utah
+neighbors[[colorado_index]] <- sort(unique(as.integer(c(neighbors[[colorado_index]], utah_index))))
+neighbors[[utah_index]] <- sort(unique(as.integer(c(neighbors[[utah_index]], colorado_index))))
+
+# Update the neighbors list for Nebraska and Iowa
+neighbors[[nebraska_index]] <- sort(unique(as.integer(c(neighbors[[nebraska_index]], iowa_index))))
+neighbors[[iowa_index]] <- sort(unique(as.integer(c(neighbors[[iowa_index]], nebraska_index))))
+
+
+
+
+lw <- nb2listw(neighbors, style = "B", zero.policy = TRUE)  # Use binary weights first
+
+# Inverse distance weighting
+for (i in 1:length(neighbors)) {
+  neighbor_indices <- neighbors[[i]]
+  total_weight <- 0
+  for (j in 1:length(neighbor_indices)) {
+    distance <- dist_matrix[i, neighbor_indices[j]]
+    if (!is.na(distance) && distance != 0) {
+      weight <- 1 / distance
+      lw$weights[[i]][j] <- weight
+      total_weight <- total_weight + weight
+    } else {
+      lw$weights[[i]][j] <- 0
+    }
+  }
+  # Normalize weights
+  if (total_weight != 0) {
+    lw$weights[[i]] <- lw$weights[[i]] / total_weight
+  }
+}
+
+# Function to replicate weights and neighbors while maintaining class attributes and style (NOT USED FOR SPATIAL PLM)
+replicate_listw <- function(lw, times) {
+  replicated_weights <- rep(lw$weights, times)
+  replicated_neighbours <- do.call("c", replicate(times, lw$neighbours, simplify = FALSE))
+  
+  # Ensure neighbours has correct nb structure and region.id is a character
+  class(replicated_neighbours) <- class(lw$neighbours)
+  
+  # create listw structure, copying the structure of lw
+  expanded_weights <- list(
+    style = lw$style,  # Place style first
+    neighbours = replicated_neighbours,  # Place neighbours second
+    weights = replicated_weights  # Place weights last
+  )
+  class(expanded_weights) <- class(lw)
+  
+  return(expanded_weights)
+}
+
+# Determine the number of years
+num_years <- length(unique(final_df$Year))
+num_rows <- nrow(final_df)
+num_reps <- num_rows / length(lw$weights)
+
+weights_across_years <- replicate_listw(lw, num_reps)
+
+# Plot neighbors connections
+plot(st_geometry(nb), border = "black") # plot polygons with gray borders
+plot(neighbors, st_coordinates(st_centroid(st_geometry(nb))), add = TRUE, col = "blue", lwd = 1.5)
+```
+
+```{r}
+ggplot(model_ready, aes(log(Percent_white), homePrems)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  
+  labs(
+    title = "Average Homeowners Premiums vs PopDensity",
+    x = "PopDensity",
+    y = "Average Premiums")
+```
+
+# Models
+
+```{r}
+panel_data <- model_ready 
+
+panel_data <- panel_data %>%
+  mutate(across(where(is.numeric), ~ ifelse(. == 0, . + 1e-07, .)))
+```
+
+## Home Damage
+
+### No Region
+
+```{r}
+# testing some shit
+## Final Model
+# Error
+M1S <- spml(homePrems ~ log(home_damage) + log(disaster_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity),
+                   data = panel_data, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "individual",
+                   lag = FALSE,
+                   spatial.error = "b")
+
+summary_M1S <- summary(M1S)
+
+summary_M1S
+
+model1 <- coeftest(summary_M1S)
+```
+
+```{r}
+## Final Model
+# Error
+M1Y <- spml(homePrems ~ log(home_damage) + log(disaster_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity),
+                   data = panel_data, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "time",
+                   lag = FALSE,
+                   spatial.error = "b")
+
+summary_M1Y <- summary(M1Y)
+
+summary_M1Y
+
+model2 <- coeftest(summary_M1Y)
+```
+
+```{r}
+## Final Model
+# Error
+M1SY <- spml(homePrems ~ log(home_damage) + log(disaster_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity),
+                   data = panel_data, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "twoways",
+                   lag = FALSE,
+                   spatial.error = "b")
+
+summary_M1SY <- summary(M1SY)
+
+summary_M1SY
+
+model3 <- coeftest(summary_M1SY)
+```
+
+### Region
+
+
+```{r}
+# testing some shit
+## Final Model
+# Error
+M2S <- spml(homePrems ~ log(home_damage) + log(disaster_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity),
+                   data = panel_data, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "individual",
+                   lag = FALSE,
+                   spatial.error = "b")
+
+summary_M2S <- summary(M2S)
+
+summary_M2S
+```
+
+```{r}
+## Final Model
+# Error
+M2Y <- spml(homePrems ~ log(home_damage) + log(disaster_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity) + Region,
+                   data = panel_data, 
+                   index = c("State", "Year"),
+                   listw =  lw,
+                   model = "within",
+                   effect = "time",
+                   lag = FALSE,
+                   spatial.error = "b")
+
+summary_M2Y <- summary(M2Y)
+
+summary_M2Y
+
+model4 <- coeftest(summary_M2Y)
+```
+
+## NRI
+
+### no Region
+
+```{r}
+# Lag
+M3S <- spml(homePrems ~ log(combined_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity),
+                   data = panel_data, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "individual",
+                   lag = FALSE,
+                   spatial.error = "b")
+
+summary_M3S <- summary(M3S)
+
+summary_M3S
+
+model6 <- coeftest(summary_M3S)
+```
+
+```{r}
+# Lag
+M3Y <- spml(homePrems ~ log(combined_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity),
+                   data = panel_data, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "time",
+                   lag = FALSE,
+                   spatial.error = "b")
+
+summary_M3Y <- summary(M3Y)
+
+summary_M3Y
+
+model7 <- coeftest(summary_M3Y)
+```
+
+```{r}
+## Final Model
+# Error
+M3SY <- spml(homePrems ~ log(combined_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity),
+                   data = panel_data, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "twoways",
+                   lag = FALSE,
+                   spatial.error = "b")
+
+summary_M3SY <- summary(M3SY)
+
+summary_M3SY
+
+model8 <- coeftest(summary_M3SY)
+```
+
+### Region 
+
+```{r}
+# Lag
+M4S <- spml(homePrems ~ log(combined_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity),
+                   data = panel_data, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "individual",
+                   lag = FALSE,
+                   spatial.error = "b")
+
+summary_M4S <- summary(M4S)
+
+summary_M4S
+```
+
+```{r}
+# Lag
+M4Y <- spml(homePrems ~ log(combined_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity) + Region,
+                   data = panel_data, 
+                   index = c("State", "Year"),
+                   listw = lw,
+                   model = "within",
+                   effect = "time",
+                   lag = FALSE,
+                   spatial.error = "b")
+
+summary_M4Y <- summary(M4Y)
+
+summary_M4Y
+
+model9 <- coeftest(summary_M4Y)
+```
+
+
+# Stargazer
+
+```{r, warning=FALSE, message=FALSE, results= "asis", include=TRUE}
+stargazer(model1,model2,model4,model3,
+          type = "text",
+          report=('vc*p'),
+          single.row = TRUE,
+          digits = 3,
+          keep.stat = c("n","rsq","adj.rsq"),
+          notes = "P-values reported in parentheses, <em>&#42;p&lt;0.1;&#42;&#42;p&lt;0.05;&#42;&#42;&#42;p&lt;0.01</em>",
+          notes.append = FALSE,
+          title = "Regression Models",
+          model.numbers = FALSE,
+          column.labels = c("State FE", "Year FE", "Region FE Year FE", "State FE Year FE")) 
+```
+
+```{r, warning=FALSE, message=FALSE, results= "asis", include=TRUE}
+stargazer(model6,model7,model9,model8,
+          type = "text",
+          report=('vc*p'),
+          single.row = TRUE,
+          digits = 3,
+          keep.stat = c("n","rsq","adj.rsq"),
+          notes = "P-values reported in parentheses, <em>&#42;p&lt;0.1;&#42;&#42;p&lt;0.05;&#42;&#42;&#42;p&lt;0.01</em>",
+          notes.append = FALSE,
+          title = "Regression Models",
+          model.numbers = FALSE,
+          column.labels = c("State FE", "Year FE", "Region FE Year FE", "State FE Year FE"))
+```
+
+
+```{r, warning=FALSE, message=FALSE, results= "asis", include=TRUE}
+stargazer(model3,model8,
+          type = "text",
+          report=('vc*p'),
+          single.row = TRUE,
+          digits = 3,
+          keep.stat = c("n","rsq","adj.rsq"),
+          notes = "P-values reported in parentheses, <em>&#42;p&lt;0.1;&#42;&#42;p&lt;0.05;&#42;&#42;&#42;p&lt;0.01</em>",
+          notes.append = FALSE,
+          title = "Regression Models",
+          model.numbers = FALSE,
+          column.labels = c("Reg Year FE", "Reg NRI Year FE"))   
+```
+```{r}
+### FIXED EFFECTS MODEL ###
+fixed_effects_model <- plm(homePrems ~ log(home_damage) + log(disaster_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity), data = panel_data, index = c("State", "Year"), model = "within", effect = "twoways")
+
+# Model Summary
+summary(fixed_effects_model)
+
+# Extract residuals from the fixed effects model
+residuals_fixed_effects <- residuals(fixed_effects_model)
+
+fixed_test<- homePrems ~ log(home_damage) + log(disaster_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity)
+slmtest(fixed_test, model_ready_scaled, lw, test = c("rlme"), index = c("State", "Year"), model = "pooling") 
+slmtest(fixed_test, model_ready_scaled, lw, test = c("rlml"), index = c("State", "Year"), model = "pooling") #"lme","lml","rlme","rlml"
+```
+```{r}
+fit.err <- errorsarlm(homePrems ~ log(home_damage) + log(disaster_damage) + log(AvgHomePrice) + log(Percent_white) + log(PopDensity) + factor(State) + factor(Year), data = panel_data,  listw = listw2U(weights_across_years), zero.policy = TRUE)
+
+summary(fit.err)
+```
+
+```{r}
+# step 1
+
+# Define the independent variable for the partial dependency plot
+independent_var <- "home_damage"  # The variable of interest
+
+# Drop the geometry column if it exists
+panel_data_no_geom <- panel_data %>% 
+  select(where(~ !inherits(.x, "sfc")))
+
+panel_data_no_geom <- as.data.frame(panel_data_no_geom)
+
+# Manually log-transform the selected variables
+logged_means <- panel_data_no_geom %>%
+  summarise(
+    log_home_damage = mean(log(home_damage), na.rm = TRUE),
+    log_disaster_damage = mean(log(disaster_damage), na.rm = TRUE),
+    log_AvgHomePrice = mean(log(AvgHomePrice), na.rm = TRUE),
+    log_Percent_white = mean(log(Percent_white), na.rm = TRUE),
+    log_PopDensity = mean(log(PopDensity), na.rm = TRUE)
+  ) %>%
+  as.list()  # Convert to list for easy indexing
+
+# Create a sequence of values for the independent variable of interest (log-transformed)
+x_range <- seq(min(log(panel_data_no_geom[[independent_var]]), na.rm = TRUE), 
+               max(log(panel_data_no_geom[[independent_var]]), na.rm = TRUE), 
+               length.out = 576)
+
+# Extract model coefficients
+coeffs <- coef(M1SY)
+
+# Remove the spatial error term (rho)
+coeffs <- coeffs[!names(coeffs) %in% "rho"]
+
+
+# Generate new dataset for predictions
+new_data <- data.frame(log_home_damage = x_range)
+
+# Add fixed mean values for other logged variables
+new_data$log_disaster_damage <- logged_means$log_disaster_damage
+new_data$log_AvgHomePrice <- logged_means$log_AvgHomePrice
+new_data$log_Percent_white <- logged_means$log_Percent_white
+new_data$log_PopDensity <- logged_means$log_PopDensity
+
+# Manually compute predicted values without rho
+new_data$predicted_y <- 
+  coeffs[1] * new_data$log_home_damage +
+  coeffs[2] * new_data$log_disaster_damage +
+  coeffs[3] * new_data$log_AvgHomePrice +
+  coeffs[4] * new_data$log_Percent_white +
+  coeffs[5] * new_data$log_PopDensity
+
+# Plot the partial dependence
+graph1 <- ggplot(new_data, aes(x = log_home_damage, y = predicted_y)) +
+  geom_line() +
+  labs(title = "Partial Dependence of log(home_damage)", 
+       x = "log(home_damage)", 
+       y = "Predicted Value") +
+  theme_minimal()
+
+# step 2
+
+# Define the independent variable for the partial dependency plot
+independent_var <- "disaster_damage"  # The variable of interest
+
+# Drop the geometry column if it exists
+panel_data_no_geom <- panel_data %>% 
+  select(where(~ !inherits(.x, "sfc")))
+
+panel_data_no_geom <- as.data.frame(panel_data_no_geom)
+
+# Manually log-transform the selected variables
+logged_means <- panel_data_no_geom %>%
+  summarise(
+    log_home_damage = mean(log(home_damage), na.rm = TRUE),
+    log_disaster_damage = mean(log(disaster_damage), na.rm = TRUE),
+    log_AvgHomePrice = mean(log(AvgHomePrice), na.rm = TRUE),
+    log_Percent_white = mean(log(Percent_white), na.rm = TRUE),
+    log_PopDensity = mean(log(PopDensity), na.rm = TRUE)
+  ) %>%
+  as.list()  # Convert to list for easy indexing
+
+# Create a sequence of values for the independent variable of interest (log-transformed)
+x_range <- seq(min(log(panel_data_no_geom[[independent_var]]), na.rm = TRUE), 
+               max(log(panel_data_no_geom[[independent_var]]), na.rm = TRUE), 
+               length.out = 576)
+
+# Extract model coefficients
+coeffs <- coef(M1SY)
+
+# Remove the spatial error term (rho)
+coeffs <- coeffs[!names(coeffs) %in% "rho"]
+
+
+# Generate new dataset for predictions
+new_data <- data.frame(log_disaster_damage = x_range)
+
+# Add fixed mean values for other logged variables
+new_data$log_home_damage <- logged_means$log_home_damage
+new_data$log_AvgHomePrice <- logged_means$log_AvgHomePrice
+new_data$log_Percent_white <- logged_means$log_Percent_white
+new_data$log_PopDensity <- logged_means$log_PopDensity
+
+# Manually compute predicted values without rho
+new_data$predicted_y <- 
+  coeffs[1] * new_data$log_home_damage +
+  coeffs[2] * new_data$log_disaster_damage +
+  coeffs[3] * new_data$log_AvgHomePrice +
+  coeffs[4] * new_data$log_Percent_white +
+  coeffs[5] * new_data$log_PopDensity
+
+# Plot the partial dependence
+graph2 <- ggplot(new_data, aes(x = log_disaster_damage, y = predicted_y)) +
+  geom_line() +
+  labs(title = "Partial Dependence of log(disaster_damage)", 
+       x = "log(disaster_damage)", 
+       y = "Predicted Value") +
+  theme_minimal()
+
+# step 3
+
+# Define the independent variable for the partial dependency plot
+independent_var <- "AvgHomePrice"  # The variable of interest
+
+# Drop the geometry column if it exists
+panel_data_no_geom <- panel_data %>% 
+  select(where(~ !inherits(.x, "sfc")))
+
+panel_data_no_geom <- as.data.frame(panel_data_no_geom)
+
+# Manually log-transform the selected variables
+logged_means <- panel_data_no_geom %>%
+  summarise(
+    log_home_damage = mean(log(home_damage), na.rm = TRUE),
+    log_disaster_damage = mean(log(disaster_damage), na.rm = TRUE),
+    log_AvgHomePrice = mean(log(AvgHomePrice), na.rm = TRUE),
+    log_Percent_white = mean(log(Percent_white), na.rm = TRUE),
+    log_PopDensity = mean(log(PopDensity), na.rm = TRUE)
+  ) %>%
+  as.list()  # Convert to list for easy indexing
+
+# Create a sequence of values for the independent variable of interest (log-transformed)
+x_range <- seq(min(log(panel_data_no_geom[[independent_var]]), na.rm = TRUE), 
+               max(log(panel_data_no_geom[[independent_var]]), na.rm = TRUE), 
+               length.out = 576)
+
+# Extract model coefficients
+coeffs <- coef(M1SY)
+
+# Remove the spatial error term (rho)
+coeffs <- coeffs[!names(coeffs) %in% "rho"]
+
+
+# Generate new dataset for predictions
+new_data <- data.frame(log_AvgHomePrice = x_range)
+
+# Add fixed mean values for other logged variables
+new_data$log_disaster_damage <- logged_means$log_disaster_damage
+new_data$log_home_damage <- logged_means$log_home_damage
+new_data$log_Percent_white <- logged_means$log_Percent_white
+new_data$log_PopDensity <- logged_means$log_PopDensity
+
+# Manually compute predicted values without rho
+new_data$predicted_y <- 
+  coeffs[1] * new_data$log_home_damage +
+  coeffs[2] * new_data$log_disaster_damage +
+  coeffs[3] * new_data$log_AvgHomePrice +
+  coeffs[4] * new_data$log_Percent_white +
+  coeffs[5] * new_data$log_PopDensity
+
+# Plot the partial dependence
+graph3 <- ggplot(new_data, aes(x = log_AvgHomePrice, y = predicted_y)) +
+  geom_line() +
+  labs(title = "Partial Dependence of log(AvgHomePrice)", 
+       x = "log(AvgHomePrice)", 
+       y = "Predicted Value") +
+  theme_minimal()
+
+# step 4
+
+# Define the independent variable for the partial dependency plot
+independent_var <- "Percent_white"  # The variable of interest
+
+# Drop the geometry column if it exists
+panel_data_no_geom <- panel_data %>% 
+  select(where(~ !inherits(.x, "sfc")))
+
+panel_data_no_geom <- as.data.frame(panel_data_no_geom)
+
+# Manually log-transform the selected variables
+logged_means <- panel_data_no_geom %>%
+  summarise(
+    log_home_damage = mean(log(home_damage), na.rm = TRUE),
+    log_disaster_damage = mean(log(disaster_damage), na.rm = TRUE),
+    log_AvgHomePrice = mean(log(AvgHomePrice), na.rm = TRUE),
+    log_Percent_white = mean(log(Percent_white), na.rm = TRUE),
+    log_PopDensity = mean(log(PopDensity), na.rm = TRUE)
+  ) %>%
+  as.list()  # Convert to list for easy indexing
+
+# Create a sequence of values for the independent variable of interest (log-transformed)
+x_range <- seq(min(log(panel_data_no_geom[[independent_var]]), na.rm = TRUE), 
+               max(log(panel_data_no_geom[[independent_var]]), na.rm = TRUE), 
+               length.out = 576)
+
+# Extract model coefficients
+coeffs <- coef(M1SY)
+
+# Remove the spatial error term (rho)
+coeffs <- coeffs[!names(coeffs) %in% "rho"]
+
+
+# Generate new dataset for predictions
+new_data <- data.frame(log_Percent_white = x_range)
+
+# Add fixed mean values for other logged variables
+new_data$log_disaster_damage <- logged_means$log_disaster_damage
+new_data$log_AvgHomePrice <- logged_means$log_AvgHomePrice
+new_data$log_home_damage <- logged_means$log_home_damage
+new_data$log_PopDensity <- logged_means$log_PopDensity
+
+# Manually compute predicted values without rho
+new_data$predicted_y <- 
+  coeffs[1] * new_data$log_home_damage +
+  coeffs[2] * new_data$log_disaster_damage +
+  coeffs[3] * new_data$log_AvgHomePrice +
+  coeffs[4] * new_data$log_Percent_white +
+  coeffs[5] * new_data$log_PopDensity
+
+# Plot the partial dependence
+graph4 <- ggplot(new_data, aes(x = log_Percent_white, y = predicted_y)) +
+  geom_line() +
+  labs(title = "Partial Dependence of log(Percent_white)", 
+       x = "log(Percent_white)", 
+       y = "Predicted Value") +
+  theme_minimal()
+
+# step 5
+
+# Define the independent variable for the partial dependency plot
+independent_var <- "PopDensity"  # The variable of interest
+
+# Drop the geometry column if it exists
+panel_data_no_geom <- panel_data %>% 
+  select(where(~ !inherits(.x, "sfc")))
+
+panel_data_no_geom <- as.data.frame(panel_data_no_geom)
+
+# Manually log-transform the selected variables
+logged_means <- panel_data_no_geom %>%
+  summarise(
+    log_home_damage = mean(log(home_damage), na.rm = TRUE),
+    log_disaster_damage = mean(log(disaster_damage), na.rm = TRUE),
+    log_AvgHomePrice = mean(log(AvgHomePrice), na.rm = TRUE),
+    log_Percent_white = mean(log(Percent_white), na.rm = TRUE),
+    log_PopDensity = mean(log(PopDensity), na.rm = TRUE)
+  ) %>%
+  as.list()  # Convert to list for easy indexing
+
+# Create a sequence of values for the independent variable of interest (log-transformed)
+x_range <- seq(min(log(panel_data_no_geom[[independent_var]]), na.rm = TRUE), 
+               max(log(panel_data_no_geom[[independent_var]]), na.rm = TRUE), 
+               length.out = 576)
+
+# Extract model coefficients
+coeffs <- coef(M1SY)
+
+# Remove the spatial error term (rho)
+coeffs <- coeffs[!names(coeffs) %in% "rho"]
+
+
+# Generate new dataset for predictions
+new_data <- data.frame(log_PopDensity = x_range)
+
+# Add fixed mean values for other logged variables
+new_data$log_disaster_damage <- logged_means$log_disaster_damage
+new_data$log_AvgHomePrice <- logged_means$log_AvgHomePrice
+new_data$log_Percent_white <- logged_means$log_Percent_white
+new_data$log_home_damage <- logged_means$log_home_damage
+
+# Manually compute predicted values without rho
+new_data$predicted_y <- 
+  coeffs[1] * new_data$log_home_damage +
+  coeffs[2] * new_data$log_disaster_damage +
+  coeffs[3] * new_data$log_AvgHomePrice +
+  coeffs[4] * new_data$log_Percent_white +
+  coeffs[5] * new_data$log_PopDensity
+
+# Plot the partial dependence
+graph5 <- ggplot(new_data, aes(x = log_PopDensity, y = predicted_y)) +
+  geom_line() +
+  labs(title = "Partial Dependence of log(PopDensity)", 
+       x = "log(PopDensity)", 
+       y = "Predicted Value") +
+  theme_minimal()
+
+grid.arrange(graph1, graph2, graph3, graph4, graph5, ncol = 3)
+```
+$$
+\begin{aligned}
+\text{homePrems}_{it} &= \alpha_i + \alpha_t + \beta_1 \log(\text{home_damage}_{it}) + \beta_2 \log(\text{disaster_damage}_{it}) + \beta_3 \log(\text{AvgHomePrice}_{it}) \\
+&\quad + \beta_4 \log(\text{Percent_white}_{it}) + \beta_5 \log(\text{PopDensity}_{it}) + \epsilon_{it} \\
+\text{where } \epsilon_{it} &= \rho (I_T \otimes W_N) \epsilon_{it} + \nu_{it}, \quad |\rho| < 1 \\
+\nu_{it} &\sim \text{IID}(0, \sigma^2_{\nu}), \quad \epsilon_{it} \sim \text{IID}(0, \sigma^2_{\epsilon})
+\end{aligned}
+$$
+
